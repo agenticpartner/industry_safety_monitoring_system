@@ -1,0 +1,275 @@
+# Zone definitions for nvdsanalytics. Source of truth — `configs/analytics/analytics.txt` is
+# GENERATED from this by `scripts/make_zones.py --generate`.
+#
+# Coordinates are NORMALISED (0..1, origin top-left), so they survive a resolution change and can
+# be checked by eye against a preview render:
+#
+#     python3 scripts/make_zones.py --preview 1 2      # build/zone_preview/camNN.jpg
+#     python3 scripts/make_zones.py --generate
+#
+# The 20 demo clips come from only 16 distinct source views (12 in mtmc_12cam + 4 in mtmc_4cam);
+# cam17-20 repeat the views of cam01-04 with a +3s offset, so they use `same_as` rather than
+# duplicated coordinates that would drift apart when edited.
+#
+# `kind`:
+#   roi          ordinary walkway. Presence recorded on the event, severity unchanged.
+#   restricted   vehicle / hazard area. A PPE violation HERE is escalated — this is the whole
+#                point of the phase: "no helmet in the forklift aisle" is not the same finding
+#                as "no helmet in a corridor".
+#   overcrowding occupancy limit; fires when more than `threshold` objects are inside.
+#   line         crossing counter. Four points: TWO for the direction vector, then TWO for the
+#                line being crossed. Reversing them counts crossings the wrong way.
+#
+# `severity` is product meaning, read by app/safety_pipeline.py — nvdsanalytics never sees it.
+
+config_width: 1920
+config_height: 1080
+osd_mode: 1              # 1 = draw zone outlines; 2 adds text that is unreadable on a 20-tile wall
+display_font_size: 10
+preview_seek: 12         # seconds into the clip to grab the preview frame
+
+cameras:
+  # --- cam01: two aisles either side of a central rack; forklift + coned-off area across the top
+  1:
+    zones:
+      - name: AisleLeft
+        kind: roi
+        severity: medium
+        points: [[0.039, 1.00], [0.224, 0.139], [0.344, 0.139], [0.383, 1.00]]
+      - name: AisleRight
+        kind: roi
+        severity: medium
+        points: [[0.521, 1.00], [0.510, 0.139], [0.688, 0.139], [0.938, 1.00]]
+      - name: VehicleZone
+        kind: restricted
+        severity: high
+        points: [[0.510, 0.00], [0.700, 0.00], [0.700, 0.185], [0.510, 0.185]]
+      - name: AisleLeftOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.039, 1.00], [0.224, 0.139], [0.344, 0.139], [0.383, 1.00]]
+
+  # --- cam02: spill/debris area under cones + wet-floor signs on the left; forklift working right
+  2:
+    zones:
+      - name: SpillZone
+        kind: restricted
+        severity: high
+        points: [[0.135, 0.40], [0.395, 0.40], [0.395, 0.97], [0.135, 0.97]]
+      - name: ForkliftAisle
+        kind: restricted
+        severity: high
+        points: [[0.545, 0.30], [0.870, 0.30], [0.940, 1.00], [0.545, 1.00]]
+      - name: AisleWalkway
+        kind: roi
+        severity: medium
+        points: [[0.545, 0.05], [0.640, 0.05], [0.640, 0.30], [0.545, 0.30]]
+
+  # --- cam03: aisles 03/04, rack left-of-centre, wide right walkway, no hazard present
+  3:
+    zones:
+      - name: AisleLeft
+        kind: roi
+        severity: medium
+        points: [[0.00, 0.62], [0.07, 0.12], [0.28, 0.12], [0.33, 1.00]]
+      - name: AisleRight
+        kind: roi
+        severity: medium
+        points: [[0.50, 1.00], [0.48, 0.10], [0.66, 0.10], [0.89, 1.00]]
+      - name: AisleRightOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.50, 1.00], [0.48, 0.10], [0.66, 0.10], [0.89, 1.00]]
+
+  # --- cam04: aisles 04/03, worker in left aisle
+  4:
+    zones:
+      - name: AisleLeft
+        kind: roi
+        severity: medium
+        points: [[0.02, 0.85], [0.19, 0.05], [0.34, 0.05], [0.38, 1.00]]
+      - name: AisleRight
+        kind: roi
+        severity: medium
+        points: [[0.52, 1.00], [0.52, 0.05], [0.73, 0.05], [0.90, 1.00]]
+      - name: AisleLeftOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.02, 0.85], [0.19, 0.05], [0.34, 0.05], [0.38, 1.00]]
+
+  # --- cam05: aisles 01/02, three workers (two left, one right) — overcrowding fires at 2
+  5:
+    zones:
+      - name: AisleLeft
+        kind: roi
+        severity: medium
+        points: [[0.03, 0.98], [0.20, 0.06], [0.36, 0.06], [0.38, 0.98]]
+      - name: AisleRight
+        kind: roi
+        severity: medium
+        points: [[0.50, 0.98], [0.50, 0.06], [0.67, 0.06], [0.87, 0.98]]
+      - name: AisleLeftOC
+        kind: overcrowding
+        threshold: 2
+        points: [[0.03, 0.98], [0.20, 0.06], [0.36, 0.06], [0.38, 0.98]]
+
+  # --- cam06: aisles 02/01, narrow left aisle
+  6:
+    zones:
+      - name: AisleLeft
+        kind: roi
+        severity: medium
+        points: [[0.02, 0.85], [0.27, 0.05], [0.33, 0.05], [0.36, 0.95]]
+      - name: AisleRight
+        kind: roi
+        severity: medium
+        points: [[0.50, 0.95], [0.50, 0.03], [0.67, 0.03], [0.95, 0.95]]
+
+  # --- cam07: aisle ends with KEEP CLEAR hatching on the left, open cross-aisle + loading door
+  7:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.33, 1.00], [0.50, 0.35], [0.73, 0.12], [1.00, 0.22], [1.00, 1.00]]
+      - name: KeepClear
+        kind: restricted
+        severity: high
+        points: [[0.17, 0.73], [0.37, 0.73], [0.37, 0.94], [0.17, 0.94]]
+
+  # --- cam08: mirror of cam07 — open cross-aisle left, racking + hatching right
+  8:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.05, 0.30], [0.35, 0.22], [0.72, 1.00], [0.05, 1.00]]
+      - name: KeepClear
+        kind: restricted
+        severity: high
+        points: [[0.57, 0.75], [0.72, 0.75], [0.72, 0.93], [0.57, 0.93]]
+
+  # --- cam09: open cross-aisle floor, aisle ends right, KEEP CLEAR bay by the wall
+  9:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.00, 0.28], [0.50, 0.17], [1.00, 0.62], [1.00, 1.00], [0.00, 1.00]]
+      - name: KeepClear
+        kind: restricted
+        severity: high
+        points: [[0.02, 0.19], [0.14, 0.19], [0.15, 0.25], [0.03, 0.25]]
+      - name: CrossAisleOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.00, 0.28], [0.50, 0.17], [1.00, 0.62], [1.00, 1.00], [0.00, 1.00]]
+
+  # --- cam10: aisle ends top-left, cone + step-ladder obstruction mid-left, open floor right
+  10:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.30, 1.00], [0.45, 0.25], [0.65, 0.10], [1.00, 0.12], [1.00, 1.00]]
+      - name: KeepClear
+        kind: restricted
+        severity: high
+        points: [[0.16, 0.55], [0.31, 0.55], [0.31, 0.68], [0.16, 0.68]]
+      - name: ConeHazard
+        kind: restricted
+        severity: high
+        points: [[0.44, 0.24], [0.53, 0.24], [0.53, 0.34], [0.44, 0.34]]
+
+  # --- cam11: wide cross-aisle in front of several aisle ends, four workers
+  11:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.00, 0.72], [1.00, 0.60], [1.00, 1.00], [0.00, 1.00]]
+      - name: KeepClear
+        kind: restricted
+        severity: high
+        points: [[0.31, 0.72], [0.44, 0.72], [0.44, 0.79], [0.31, 0.79]]
+      - name: CrossAisleOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.00, 0.72], [1.00, 0.60], [1.00, 1.00], [0.00, 1.00]]
+
+  # --- cam12: overview of multiple aisle ends and the cross-aisle floor
+  12:
+    zones:
+      - name: CrossAisle
+        kind: restricted
+        severity: high
+        points: [[0.00, 0.70], [1.00, 0.55], [1.00, 1.00], [0.00, 1.00]]
+      - name: CrossAisleOC
+        kind: overcrowding
+        threshold: 3
+        points: [[0.00, 0.70], [1.00, 0.55], [1.00, 1.00], [0.00, 1.00]]
+
+  # --- cam13..16 are the mtmc_4cam environment: a bright open floor where NOBODY wears PPE.
+  # Expect these tiles to be a wall of violations — that is the footage, not a bug.
+  13:
+    zones:
+      - name: MainFloor
+        kind: roi
+        severity: medium
+        points: [[0.00, 0.30], [1.00, 0.05], [1.00, 1.00], [0.00, 1.00]]
+      - name: MainFloorOC
+        kind: overcrowding
+        threshold: 4
+        points: [[0.00, 0.30], [1.00, 0.05], [1.00, 1.00], [0.00, 1.00]]
+
+  14:
+    zones:
+      - name: MainFloor
+        kind: roi
+        severity: medium
+        points: [[0.00, 0.20], [1.00, 0.08], [1.00, 1.00], [0.00, 1.00]]
+      - name: PalletStorage
+        kind: restricted
+        severity: high
+        points: [[0.15, 0.09], [0.36, 0.09], [0.36, 0.25], [0.15, 0.25]]
+      - name: MainFloorOC
+        kind: overcrowding
+        threshold: 5
+        points: [[0.00, 0.20], [1.00, 0.08], [1.00, 1.00], [0.00, 1.00]]
+
+  15:
+    zones:
+      - name: MainFloor
+        kind: roi
+        severity: medium
+        points: [[0.00, 0.28], [1.00, 0.12], [1.00, 1.00], [0.00, 1.00]]
+      - name: PillarHazard
+        kind: restricted
+        severity: high
+        points: [[0.455, 0.165], [0.535, 0.165], [0.535, 0.215], [0.455, 0.215]]
+      - name: MainFloorOC
+        kind: overcrowding
+        threshold: 5
+        points: [[0.00, 0.28], [1.00, 0.12], [1.00, 1.00], [0.00, 1.00]]
+
+  16:
+    zones:
+      - name: MainFloor
+        kind: roi
+        severity: medium
+        points: [[0.00, 0.15], [0.72, 0.02], [0.80, 1.00], [0.00, 1.00]]
+      - name: PalletStorage
+        kind: restricted
+        severity: high
+        points: [[0.72, 0.30], [1.00, 0.30], [1.00, 1.00], [0.72, 1.00]]
+      - name: MainFloorOC
+        kind: overcrowding
+        threshold: 4
+        points: [[0.00, 0.15], [0.72, 0.02], [0.80, 1.00], [0.00, 1.00]]
+
+  # cam17-20 replay the cam01-04 source views with a +3s offset (see scripts/make_streams.sh),
+  # so they share geometry. Aliased rather than copied so the two never drift apart.
+  17: {same_as: 1}
+  18: {same_as: 2}
+  19: {same_as: 3}
+  20: {same_as: 4}

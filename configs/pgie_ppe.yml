@@ -1,0 +1,57 @@
+# PGIE-1 — PPE / helmet / vest detector
+#
+# Model : YOLO11n, 4 classes  [0] helmet  [1] human  [2] no-helmet  [3] vest
+# Head  : output0 [batch, 8, anchors] = 4 box coords + 4 class scores, channel-major, PRE-NMS
+#         -> cluster-mode 2 (DeepStream runs NMS) + NvDsInferParseYoloPreNMS
+#
+# There is no `no-vest` class. Helmet violations come straight off `no-helmet`; vest violations
+# are INFERRED in app/rules.py from a `human` with no overlapping `vest`, which is a weaker
+# signal — see the note in that file.
+
+property:
+  gpu-id: 0
+  gie-unique-id: 1
+  process-mode: 1          # primary: operates on full frames
+  network-type: 0          # detector
+
+  onnx-file: ../models/ppe/model/ppe.onnx
+  model-engine-file: ../models/ppe/model/ppe_gpu_b20_fp16.engine
+  labelfile-path: ../models/ppe/config/labels.txt
+
+  batch-size: 20
+  network-mode: 2          # 0=FP32 1=INT8 2=FP16
+
+  # REQUIRED: the ONNX was exported with dynamic axes, so TensorRT sees -1 without this and
+  # fails with "setDimensions: Error Code 3".
+  infer-dims: 3;640;640
+
+  # Ultralytics preprocessing: RGB, /255, centred letterbox.
+  net-scale-factor: 0.0039215697
+  model-color-format: 0    # RGB
+  maintain-aspect-ratio: 1
+  symmetric-padding: 1
+
+  num-detected-classes: 4
+  cluster-mode: 2          # NMS — must match the PRE-NMS head
+  parse-bbox-func-name: NvDsInferParseYoloPreNMS
+  custom-lib-path: ../models/parser/libnvds_yolo_parser.so
+
+  # Infer every 2nd frame; the tracker carries identities across the gap. At 20 streams this is
+  # 300 inferences/s instead of 600.
+  interval: 1
+
+  # DLA placement is decided by bench/dla_qualification.md — all-or-nothing, never partial.
+  # Uncomment ONLY if this model passed the gate.
+  # enable-dla: 1
+  # use-dla-core: 1
+
+class-attrs-all:
+  pre-cluster-threshold: 0.30
+  nms-iou-threshold: 0.45
+  topk: 100
+
+# Vest evidence drives an inferred violation, so demand more confidence before trusting it.
+class-attrs-3:
+  pre-cluster-threshold: 0.40
+  nms-iou-threshold: 0.45
+  topk: 100

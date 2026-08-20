@@ -1,0 +1,1263 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0e">
+<title>Industry Safety Operations Monitoring System</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!--
+  Served by services/api.py at /. Entirely self-contained: no CDN, no chart library, no external
+  fonts — the browser loads this page FROM the Jetson, which has no guaranteed internet on a plant
+  network, so anything fetched from outside would simply fail.
+
+  Dark-first by design: this is a monitoring wall that sits on a screen for hours. Light mode is
+  available but dark is the default, and both palettes are the dataviz skill's validated
+  categorical set (validate_palette.js passes every check against BOTH surfaces, including the
+  darker #14161a card used here).
+
+  RTSP is not playable in a browser. mediamtx re-publishes the same stream as WebRTC (WHEP,
+  sub-second) and HLS (~5-10s, the iOS fallback); the live panel negotiates WHEP directly.
+-->
+<style>
+  /* Navy + yellow. Yellow is the ACCENT, never a surface: it is the highest-contrast thing on
+     the page (8.6:1 on the card navy) and carries emphasis — the live values, the selected day,
+     the section rules. Painting large areas with it would spend that contrast on decoration and
+     leave nothing to mark what matters.
+
+     The five series colours are unchanged and deliberately so: they are the dataviz skill's
+     validated dark steps, re-checked against the new navy card surface with
+     `validate_palette.js --mode dark --surface #16233f` — lightness band, chroma floor, CVD
+     separation (worst adjacent ΔE 8.4), normal-vision floor and 3:1 contrast all pass. A theme
+     change is exactly when a palette quietly stops being legible, so it was re-run rather than
+     assumed. */
+  :root[data-theme="dark"], :root:not([data-theme]) {
+    color-scheme: dark;
+    --bg:        #0f1b33;
+    --surface-1: #1b2c4e;
+    --surface-2: #23375d;
+    --surface-3: #2c4270;
+    --border:    #2b4272;
+    --border-2:  #3b568f;
+    --text-1:    #eef2fa;
+    --text-2:    #a9b6d0;
+    --text-3:    #7385a6;
+    --accent:    #f2b705;
+    --accent-2:  #ffd466;
+    --on-accent: #10192e;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181;
+    --s6:#9085e9;
+    --ok:#2ecc8f; --warning:#e0a02a; --critical:#ff5d55;
+    --grid: #2a3f68;
+    --glow: 0 0 0 1px rgba(242,183,5,.16), 0 10px 34px -14px rgba(0,0,0,.85);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg:#eef1f7; --surface-1:#ffffff; --surface-2:#e7ecf5; --surface-3:#dbe3f0;
+    --border:#ccd6e6; --border-2:#b3c1d8;
+    --text-1:#0d1a33; --text-2:#41536f; --text-3:#6c7c96;
+    --accent:#a97400; --accent-2:#8a5f00; --on-accent:#ffffff;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4;
+    --s6:#4a3aa7;
+    --ok:#1a7f4f; --warning:#b06f00; --critical:#c0392b;
+    --grid:#dde4ef; --glow: 0 1px 2px rgba(13,26,51,.10);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; }
+  body {
+    background: var(--bg); color: var(--text-1);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  /* Every animation in this file is disabled for anyone who asks for reduced motion. A flashing
+     alarm is exactly the kind of effect that can be harmful, so this is not optional. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+
+  header {
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    padding:12px 18px; background:color-mix(in srgb, var(--surface-1) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom:1px solid var(--border); position:sticky; top:0; z-index:40;
+  }
+  h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  h1 span { color: var(--text-3); font-weight: 500; }
+  .spacer { flex:1; }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+    background:var(--surface-2); color:var(--text-2); font-size:12px; white-space:nowrap;
+    border:1px solid var(--border);
+  }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--text-3); flex:none; }
+  .dot.up { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+  .dot.down { background:var(--critical); box-shadow:0 0 0 3px color-mix(in srgb, var(--critical) 20%, transparent); }
+  button {
+    font:inherit; font-size:13px; padding:6px 12px; border-radius:8px;
+    border:1px solid var(--border-2); background:var(--surface-2); color:var(--text-1);
+    cursor:pointer; transition: background .15s ease, border-color .15s ease, transform .08s ease;
+  }
+  button:hover { background:var(--surface-3); border-color:var(--text-3); }
+  button:active { transform: translateY(1px); }
+  button.primary { background:var(--s1); border-color:var(--s1); color:#fff; }
+  button.danger  { background:var(--critical); border-color:var(--critical); color:#fff; }
+
+  main { padding:16px 18px 48px; max-width:1560px; margin:0 auto; }
+  .grid { display:grid; gap:13px; }
+  .kpis { grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); margin-bottom:13px; }
+  /* `align-items:stretch` (the default) is what lets the feed fill the column height instead of
+     hugging its content and leaving dead space below it. */
+  .cols { grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); }
+  .stack { gap:13px; align-content:start; }
+  .pair { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  @media (max-width:1180px){ .pair{ grid-template-columns:minmax(0,1fr);} }
+  @media (max-width:1080px){ .cols{ grid-template-columns:minmax(0,1fr);} }
+
+  /* ---- calendar ---- */
+  .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+  .cal-dow {
+    font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-3);
+    text-align:center; padding-bottom:2px;
+  }
+  .cal-day {
+    position:relative; aspect-ratio:1/1; border-radius:7px; border:1px solid var(--border);
+    background:var(--surface-2); display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:1px; cursor:default; padding:2px;
+  }
+  .cal-day .dnum { font-size:11px; color:var(--text-3); font-variant-numeric:tabular-nums; }
+  .cal-day .dn   { font-size:14px; font-weight:700; color:var(--text-1);
+                   font-variant-numeric:tabular-nums; line-height:1; }
+  .cal-day.has { cursor:pointer; }
+  .cal-day.has:hover { border-color:var(--accent); }
+  .cal-day.empty { opacity:.32; }
+  /* A day with a critical incident is marked with a dot as well as colour — colour alone is not
+     an encoding, and "the day something serious happened" is the one an operator scans for. */
+  .cal-day.crit::after {
+    content:""; position:absolute; top:4px; right:4px; width:5px; height:5px; border-radius:50%;
+    background:var(--critical);
+  }
+  .cal-day.sel { border-color:var(--accent); box-shadow:0 0 0 2px rgba(242,183,5,.28); }
+  .cal-day.today .dnum { color:var(--accent); font-weight:700; }
+  .cal-detail { margin-top:11px; border-top:1px solid var(--border); padding-top:10px;
+                font-size:12px; color:var(--text-2); min-height:64px; }
+  .cal-detail .dhead { color:var(--text-1); font-weight:600; font-size:13px; margin-bottom:6px; }
+  .cal-detail .drow { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:7px; }
+  .chip {
+    background:var(--surface-3); border:1px solid var(--border-2); border-radius:999px;
+    padding:2px 9px; font-size:11px; color:var(--text-2); font-variant-numeric:tabular-nums;
+  }
+  .chip b { color:var(--text-1); }
+  .chip.acc { border-color:var(--accent); color:var(--accent-2); }
+  .cal-list { max-height:150px; overflow-y:auto; display:flex; flex-direction:column; gap:4px; }
+  .cal-item {
+    display:flex; gap:8px; align-items:baseline; padding:4px 7px; border-radius:6px;
+    background:var(--surface-2); cursor:pointer; font-size:11.5px;
+  }
+  .cal-item:hover { background:var(--surface-3); }
+  .cal-item .t { color:var(--text-3); font-variant-numeric:tabular-nums; }
+  .cal-item .n { color:var(--text-1); font-weight:600; }
+
+  /* ---- zone donut ---- */
+  .donut-wrap { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  .donut-legend { display:flex; flex-direction:column; gap:5px; min-width:150px; flex:1; }
+  .dlg-row { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--text-2); }
+  .dlg-row .sw { width:9px; height:9px; border-radius:2px; flex:none; }
+  .dlg-row .nm { color:var(--text-1); }
+  .dlg-row .pc { margin-left:auto; font-variant-numeric:tabular-nums; color:var(--text-2); }
+
+  /* What each zone is MADE of. The donut answers "how much of our problem is this zone"; this
+     answers "and what kind", which is the question an operator asks straight after — a zone with
+     four fire alerts and one with four missing vests are not the same problem. Fills the card
+     with the answer instead of with empty navy. */
+  .zmix { margin-top:12px; border-top:1px solid var(--border); padding-top:10px;
+          display:flex; flex-direction:column; gap:7px; }
+  .zmix-row { display:grid; grid-template-columns:96px 1fr auto; gap:9px; align-items:center;
+              font-size:11.5px; }
+  .zmix-row .zn { color:var(--text-2); white-space:nowrap; overflow:hidden;
+                  text-overflow:ellipsis; }
+  .zmix-bar { display:flex; height:9px; border-radius:5px; overflow:hidden; background:var(--surface-3); }
+  .zmix-bar i { display:block; height:100%; }
+  .zmix-row .zt { color:var(--text-3); font-variant-numeric:tabular-nums; }
+  .zmix-key { display:flex; gap:12px; flex-wrap:wrap; margin-top:2px; }
+  .zmix-key span { display:inline-flex; align-items:center; gap:5px; font-size:11px;
+                   color:var(--text-3); }
+  .card {
+    background:var(--surface-1); border:1px solid var(--border); border-radius:13px;
+    padding:14px 16px; min-width:0; box-shadow: var(--glow);
+    animation: rise .35s cubic-bezier(.2,.7,.3,1) both;
+  }
+  @keyframes rise { from { opacity:0; transform: translateY(7px);} to { opacity:1; transform:none;} }
+  /* The accent earns its place by marking structure: a short yellow rule opens every panel, so
+     the eye finds section starts without another border or a heavier type weight. */
+  .card h2::before {
+    content:""; width:3px; height:13px; border-radius:2px; background:var(--accent);
+    flex:none;
+  }
+  .card h2 {
+    font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--text-3);
+    margin:0 0 10px; font-weight:600; display:flex; align-items:center; gap:8px;
+  }
+  .kpi .v { font-size:29px; font-weight:640; letter-spacing:-.02em; line-height:1.1;
+            font-variant-numeric: tabular-nums; transition: color .3s ease; }
+  .kpi .v.bump { animation: bump .5s cubic-bezier(.2,.8,.3,1); }
+  @keyframes bump { 0%{transform:scale(1)} 35%{transform:scale(1.13); color:var(--accent)} 100%{transform:scale(1)} }
+  /* The headline number carries the accent; the four beside it stay in ink. One yellow number
+     per row is emphasis, five is wallpaper. */
+  .kpi:first-child .v { color:var(--accent); }
+  h1 em { font-style:normal; color:var(--accent); }
+  .kpi .l { font-size:12px; color:var(--text-3); margin-top:2px; }
+  .kpi .sub { font-size:12px; color:var(--text-2); margin-top:4px; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:11px; margin-bottom:4px; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-2); }
+  .sw { width:9px; height:9px; border-radius:3px; flex:none; }
+  svg { display:block; width:100%; overflow:visible; }
+  polyline { transition: d .4s linear; }
+
+  /* live view */
+  .live { position:relative; background:#000; border-radius:10px; overflow:hidden; aspect-ratio:16/9; }
+  .live video { width:100%; height:100%; object-fit:contain; display:block; }
+  .live .ph {
+    position:absolute; inset:0; display:grid; place-items:center; text-align:center;
+    color:var(--text-3); font-size:13px; padding:16px; gap:8px;
+  }
+  .live-badge {
+    position:absolute; top:9px; left:9px; z-index:2; display:flex; align-items:center; gap:6px;
+    background:rgba(0,0,0,.6); padding:3px 9px; border-radius:999px; font-size:11px; color:#fff;
+  }
+  /* An <a> among <button>s: styled to match so the header reads as one control group. */
+  #btn-brain {
+    display:inline-flex; align-items:center; gap:6px; text-decoration:none;
+    font:inherit; font-size:13px; color:var(--text-1);
+    background:var(--surface-2); border:1px solid var(--border-2); border-radius:9px;
+    padding:7px 12px; cursor:pointer;
+  }
+  #btn-brain:hover { border-color:var(--accent); }
+  @media (max-width:720px){ #btn-brain span { display:none; } }
+
+  .live-badge .dot { background:var(--critical); animation: blink 1.6s ease-in-out infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+  /* Fullscreen: the wall is 20 tiles, and at card size each tile is ~180px wide — too small to
+     see a violation box. The aspect-ratio that keeps the card tidy has to be dropped here, or
+     the video letterboxes inside a 16/9 box inside a taller screen. */
+  .live:fullscreen { aspect-ratio:auto; width:100vw; height:100vh; border-radius:0; }
+  .live:fullscreen video { object-fit:contain; }
+  #btn-fs { cursor:pointer; }
+
+  /* Bounded to the viewport and sticky, NOT stretched to the left column's height. Letting it
+     fill made a single card run past the calendar, the zone chart and the agent — one panel as
+     tall as the whole page, which is neither readable nor scrollable in a useful way. Sticky
+     keeps the newest incidents in view while the operator scrolls the analytics below. */
+  #feed-card {
+    display:flex; flex-direction:column;
+    position:sticky; top:74px; max-height:calc(100vh - 92px);
+  }
+  .feed { flex:1; min-height:260px; overflow-y:auto; scrollbar-width:thin; }
+  @media (max-width:1080px){
+    #feed-card { position:static; max-height:none; }
+    .feed { max-height:60vh; }
+  }
+  .ev {
+    display:grid; grid-template-columns:auto 1fr auto; gap:3px 10px;
+    padding:9px 5px; border-bottom:1px solid var(--border); align-items:start; cursor:pointer;
+    transition: background .15s ease;
+  }
+  .ev:hover { background:var(--surface-2); }
+  .ev.fresh { animation: flash 1.6s ease-out; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--s1) 22%, transparent);} to { background:transparent;} }
+  .ev .sev { width:3px; border-radius:2px; align-self:stretch; }
+  .sev.critical { background:var(--critical); }
+  .sev.high { background:var(--critical); opacity:.75; }
+  .sev.medium { background:var(--warning); }
+  .ev .meta { font-size:11.5px; color:var(--text-3); }
+  .ev .ttl { font-weight:560; font-size:13px; }
+  .tag { font-size:11px; padding:1px 8px; border-radius:999px; background:var(--surface-2); color:var(--text-2); white-space:nowrap; }
+  .tag.confirmed { background:color-mix(in srgb, var(--critical) 18%, transparent); color:var(--critical); }
+  .tag.rejected  { background:color-mix(in srgb, var(--ok) 18%, transparent); color:var(--ok); }
+  .reason { grid-column:2/-1; font-size:12px; color:var(--text-2); }
+
+  /* toasts */
+  #toasts {
+    position:fixed; right:16px; bottom:16px; z-index:60; display:flex; flex-direction:column;
+    gap:9px; max-width:min(380px, 92vw);
+  }
+  .toast {
+    background:var(--surface-2); border:1px solid var(--border-2); border-left:3px solid var(--s1);
+    border-radius:10px; padding:10px 12px; box-shadow:0 10px 32px -12px rgba(0,0,0,.8);
+    animation: slidein .3s cubic-bezier(.2,.8,.3,1) both; cursor:pointer;
+  }
+  .toast.high, .toast.critical { border-left-color:var(--critical); }
+  .toast.medium { border-left-color:var(--warning); }
+  /* A hazard the VLM spotted is not a routine violation: it stays until dismissed and carries a
+     pulsing edge so it reads as "look at this", without borrowing the fire alarm's full screen. */
+  /* An ongoing incident is a reminder, not an emergency: it uses the warning hue and auto-
+     dismisses, unlike a hazard toast which must be cleared by hand. */
+  .toast.ongoing { border-left-color:var(--accent); }
+  .ongoing-tag {
+    color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    border-radius:999px; padding:0 6px; font-size:10.5px; white-space:nowrap;
+  }
+  .toast.hazard {
+    border-left-color:var(--warning); border-color:var(--warning);
+    animation: slidein .3s cubic-bezier(.2,.8,.3,1) both, hazpulse 1.8s ease-in-out 0.4s infinite;
+  }
+  @keyframes hazpulse {
+    0%,100% { box-shadow:0 10px 32px -12px rgba(0,0,0,.8); }
+    50%     { box-shadow:0 0 0 3px color-mix(in oklab, var(--warning) 28%, transparent),
+                         0 10px 32px -12px rgba(0,0,0,.8); }
+  }
+  .toast .t { font-weight:600; font-size:13px; }
+  .toast .b { font-size:12px; color:var(--text-2); margin-top:2px; }
+  .toast.out { animation: slideout .25s ease-in both; }
+  @keyframes slidein { from{opacity:0; transform:translateX(22px)} to{opacity:1; transform:none} }
+  @keyframes slideout { to{opacity:0; transform:translateX(22px); height:0; padding:0; margin:0} }
+
+  /* fire alarm — deliberately impossible to ignore */
+  #alarm {
+    position:fixed; inset:0; z-index:80; display:none; place-items:center;
+    background:rgba(0,0,0,.72); backdrop-filter:blur(3px);
+  }
+  #alarm.on { display:grid; }
+  #alarm .box {
+    background:var(--surface-1); border:2px solid var(--critical); border-radius:16px;
+    padding:26px 30px; text-align:center; max-width:min(520px,92vw);
+    animation: alarmpulse 1s ease-in-out infinite;
+  }
+  @keyframes alarmpulse {
+    0%,100% { box-shadow:0 0 0 0 rgba(255,93,85,.55), 0 0 40px -6px rgba(255,93,85,.5); }
+    50%     { box-shadow:0 0 0 18px rgba(255,93,85,0), 0 0 70px -4px rgba(255,93,85,.85); }
+  }
+  #alarm .ic { font-size:46px; line-height:1; animation: shake .9s ease-in-out infinite; }
+  @keyframes shake { 0%,100%{transform:rotate(-7deg)} 50%{transform:rotate(7deg)} }
+  #alarm h3 { margin:10px 0 4px; font-size:23px; letter-spacing:.02em; color:var(--critical); }
+  /* Full-viewport red wash, behind the card, pulsing. Visible from across a room. */
+  #alarm::before {
+    content:""; position:absolute; inset:0; background:var(--critical); opacity:0;
+    animation: wash 1s steps(1) infinite; pointer-events:none;
+  }
+  @keyframes wash { 0%,49%{opacity:0} 50%,100%{opacity:.13} }
+
+  /* Tall enough that an answer plus its counts table is readable without scrolling in the common
+     case — a twelve-camera breakdown is the normal size here, not an outlier. */
+  .chat { display:flex; flex-direction:column; height:420px; }
+  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding-right:4px; }
+  .msg { padding:8px 11px; border-radius:10px; max-width:92%; font-size:13px; white-space:pre-wrap;
+         animation: rise .25s ease both; }
+  .msg.u { background:var(--s1); color:#fff; align-self:flex-end; }
+  .msg.a { background:var(--surface-2); align-self:flex-start; }
+  .msg .cite { display:block; margin-top:6px; font-size:11px; color:var(--text-3); }
+  /* Clips returned by the agent. A horizontal strip so several fit without pushing the composer
+     off screen; each scrolls into view rather than wrapping into a tall stack. */
+  .clips { display:flex; gap:8px; margin-top:9px; overflow-x:auto; padding-bottom:2px; }
+  .clipcard { margin:0; flex:0 0 190px; cursor:pointer; }
+  .clipcard video {
+    width:190px; aspect-ratio:16/9; object-fit:cover; background:#000;
+    border-radius:8px; border:1px solid var(--border-2); display:block;
+  }
+  .clipcard:hover video { border-color:var(--s1); }
+  .clipcard figcaption { font-size:11px; color:var(--text-3); margin-top:4px; line-height:1.35; }
+
+  /* Counts table inside an agent answer. Scrolls in its own box so a wide breakdown never makes
+     the page scroll sideways. */
+  .counts { margin-top:9px; overflow-x:auto; }
+  .counts-cap { font-size:11px; color:var(--text-3); margin-bottom:5px; }
+  .counts table { border-collapse:collapse; font-size:11.5px; font-variant-numeric:tabular-nums; }
+  .counts th, .counts td {
+    padding:3px 9px 3px 0; text-align:right; color:var(--text-2); white-space:nowrap;
+  }
+  /* Sticky because the table can be taller than the chat box: a header scrolled out of view
+     leaves four columns of bare numbers with nothing to say which verdict each one is. */
+  .counts th {
+    color:var(--text-3); font-weight:500; border-bottom:1px solid var(--border-1);
+    position:sticky; top:0; background:var(--surface-2);
+  }
+  .counts td:first-child, .counts th:first-child { text-align:left; color:var(--text-1); }
+  .counts tbody td:last-child { color:var(--text-1); font-weight:600; }
+  .composer { display:flex; gap:8px; margin-top:9px; }
+  .composer input {
+    flex:1; font:inherit; font-size:13px; padding:9px 12px; border-radius:9px;
+    border:1px solid var(--border-2); background:var(--bg); color:var(--text-1);
+  }
+  .composer input:focus { outline:2px solid color-mix(in srgb, var(--s1) 60%, transparent); outline-offset:1px; }
+  dialog { border:1px solid var(--border-2); border-radius:14px; background:var(--surface-1); color:var(--text-1);
+           max-width:min(880px,94vw); padding:0; }
+  dialog::backdrop { background:rgba(0,0,0,.65); backdrop-filter:blur(2px); }
+  .dlg-body { padding:16px 18px 18px; }
+  video.clip { width:100%; border-radius:9px; background:#000; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th,td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--text-3); font-weight:600; }
+  .muted { color:var(--text-3); font-size:12px; }
+  details>summary { cursor:pointer; color:var(--text-3); font-size:12px; margin-top:8px; }
+  @media (max-width:640px) {
+    header { padding:10px 12px; gap:8px; } main { padding:12px 12px 40px; }
+    h1 span { display:none; } .kpi .v { font-size:24px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Industry Safety <em>Operations</em> Monitoring System <span>· AGX Orin</span></h1>
+  <span class="pill"><span class="dot" id="d-pipe"></span>pipeline</span>
+  <span class="pill"><span class="dot" id="d-vlm"></span>VLM</span>
+  <span class="pill"><span class="dot" id="d-llm"></span>agent</span>
+  <span class="pill" id="p-fps">—</span>
+  <span class="spacer"></span>
+  <button id="btn-sound" title="Alarm sound needs one click before a browser will allow audio">🔇 sound off</button>
+  <button id="btn-live">Live view</button>
+  <!-- Opens in a new tab on purpose: it is a reference to read alongside the running dashboard,
+       and navigating away would drop the WebRTC session and the alarm's primed state. -->
+  <a id="btn-brain" href="/system" target="_blank" rel="noopener"
+     title="Models, benchmarks, latencies and how the pipeline connects">🧠 <span>System</span></a>
+  <button id="btn-theme">◐</button>
+</header>
+
+<main>
+  <section class="grid kpis" id="kpis"></section>
+
+  <!-- Two columns, and the incident feed spans the full height of the right one. Previously it
+       sat in a short right column and left a screen-height of empty navy under it, which read as
+       a broken layout. The feed is also the one panel that genuinely wants to be tall: it is a
+       running log, and how much of it you can see is how far back you can look without scrolling. -->
+  <div class="grid cols">
+    <div class="grid stack">
+      <div class="card" id="live-card" hidden>
+        <h2>Live tiled output <span class="muted" id="live-mode"></span>
+          <button id="btn-fs" style="margin-left:auto;font-size:11px;padding:3px 8px"
+                  title="Fullscreen (or double-click the video)">⛶ fullscreen</button>
+        </h2>
+        <div class="live" id="live-wrap">
+          <div class="live-badge"><span class="dot"></span>LIVE</div>
+          <video id="live-video" autoplay muted playsinline></video>
+          <div class="ph" id="live-ph">
+            <div id="live-reason">Checking the live path…</div>
+            <div class="muted" id="live-action" style="font-size:12px"></div>
+            <button class="primary" id="btn-rtsp-start" hidden></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>System utilisation <span class="muted">· last 5 min · 2s</span></h2>
+        <div class="legend" id="sys-legend"></div>
+        <div id="sys-chart"></div>
+        <details><summary>Table view</summary><div id="sys-table"></div></details>
+      </div>
+
+      <!-- Calendar and zones side by side: both answer "where and when", and reading them
+           together is the point — a spike on a day means more once you can see which zone it
+           came from. -->
+      <div class="grid pair">
+        <div class="card">
+          <h2>Incident calendar
+            <span class="muted" id="cal-range"></span>
+            <span class="muted" id="cal-tz" style="margin-left:auto;font-size:11px"></span>
+          </h2>
+          <div id="cal"></div>
+          <div id="cal-detail" class="cal-detail"></div>
+        </div>
+
+        <div class="card">
+          <h2>Most affected zones <span class="muted" id="zone-total"></span></h2>
+          <div id="zone-donut"></div>
+          <details><summary>Table view</summary><div id="zone-table"></div></details>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Incidents per camera</h2>
+        <div id="cam-chart"></div>
+      </div>
+
+      <div class="card">
+        <h2>Safety agent</h2>
+        <div class="chat">
+          <div class="msgs" id="msgs">
+            <div class="msg a">Ask about incidents — “which cameras had confirmed violations?”, “how many incidents and what types?”, “show me clips from the spill zone”. Follow-ups keep context.</div>
+          </div>
+          <form class="composer" id="chat-form">
+            <input id="q" placeholder="Ask a question…" autocomplete="off">
+            <button class="primary" type="submit">Ask</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="feed-card">
+      <h2>Incident feed <button id="btn-testfire" style="margin-left:auto;font-size:11px;padding:3px 8px">test fire</button></h2>
+      <div class="feed" id="feed"></div>
+    </div>
+  </div>
+</main>
+
+<div id="toasts"></div>
+
+<div id="alarm" role="alertdialog" aria-live="assertive">
+  <div class="box">
+    <div class="ic">🔥</div>
+    <h3 id="alarm-title">FIRE DETECTED</h3>
+    <div class="muted" id="alarm-meta"></div>
+    <p id="alarm-reason" style="font-size:13px;color:var(--text-2)"></p>
+    <div style="display:flex;gap:8px;justify-content:center">
+      <button class="danger" id="alarm-ack">Acknowledge</button>
+      <button id="alarm-view">View clip</button>
+      <button id="alarm-sound" hidden>🔇 Sound is off — enable</button>
+    </div>
+  </div>
+</div>
+
+<dialog id="dlg">
+  <div class="dlg-body">
+    <h2 id="dlg-title" style="margin:0 0 3px;font-size:15px"></h2>
+    <div class="muted" id="dlg-meta" style="margin-bottom:10px"></div>
+    <video id="dlg-video" class="clip" controls preload="metadata"></video>
+    <p id="dlg-noclip" class="muted" style="font-size:12px;margin:8px 0 0" hidden></p>
+    <p id="dlg-reason" style="font-size:13px;color:var(--text-2)"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="dlg-reject">Mark false positive</button>
+      <button class="primary" id="dlg-confirm">Confirm violation</button>
+      <button id="dlg-close">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmt = v => v === null || v === undefined ? "—" : v;
+async function get(p){ const r = await fetch(p); if(!r.ok) throw new Error(p+" "+r.status); return r.json(); }
+
+/* ---------- charts: form first, colour last (dataviz method) ---------- */
+/* ---------- incident calendar ----------
+   A month grid, one cell per day, shaded by how many incidents fell on it. Sequential, so it is
+   ONE hue stepped light→dark (the dataviz rule) rather than a rainbow: the quantity is ordered,
+   and a rainbow would imply categories that do not exist. Yellow is that hue here, which also
+   makes the calendar read as the accent element of the page.
+
+   Days are LOCAL dates computed server-side (`date(ts,'unixepoch','localtime')`) — a shift that
+   starts at 08:00 should not straddle two cells because the server thinks in UTC. */
+let CAL = [], CAL_SEL = null;
+
+function calShade(n, max){
+  if (!n) return null;
+  // Four steps, not a continuous ramp: with a handful of days of data a continuous scale makes
+  // every cell a slightly different shade of the same thing, which reads as noise.
+  const t = max <= 1 ? 1 : Math.min(1, Math.log(1 + n) / Math.log(1 + max));
+  const step = t > .75 ? 4 : t > .5 ? 3 : t > .25 ? 2 : 1;
+  return {1:"rgba(242,183,5,.20)", 2:"rgba(242,183,5,.38)",
+          3:"rgba(242,183,5,.60)", 4:"rgba(242,183,5,.85)"}[step];
+}
+
+function renderCalendar(){
+  const el = $("#cal");
+  const by = Object.fromEntries(CAL.map(d => [d.d, d]));
+  const max = Math.max(1, ...CAL.map(d => d.n));
+  const today = new Date();
+  // Show the month that contains the most recent data, so an idle demo still opens on the day
+  // the incidents are on rather than on an empty current month.
+  const anchor = CAL.length ? new Date(CAL[CAL.length - 1].d + "T12:00:00") : today;
+  const y = anchor.getFullYear(), m = anchor.getMonth();
+  const first = new Date(y, m, 1), last = new Date(y, m + 1, 0);
+  const pad = (first.getDay() + 6) % 7;           // Monday-first
+  const iso = dt => `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`;
+  const todayIso = iso(today);
+
+  let cells = "";
+  for (let i = 0; i < pad; i++) cells += `<div class="cal-day empty"></div>`;
+  for (let day = 1; day <= last.getDate(); day++) {
+    const key = iso(new Date(y, m, day));
+    const d = by[key];
+    const bg = d ? calShade(d.n, max) : null;
+    cells += `<div class="cal-day ${d ? "has" : "empty"} ${d && d.critical ? "crit" : ""}
+                   ${key === CAL_SEL ? "sel" : ""} ${key === todayIso ? "today" : ""}"
+                   data-day="${key}" ${bg ? `style="background:${bg};border-color:transparent"` : ""}
+                   title="${key}${d ? ` · ${d.n} incidents` : ""}">
+                <span class="dnum">${day}</span>
+                ${d ? `<span class="dn">${d.n}</span>` : ""}
+              </div>`;
+  }
+  el.innerHTML =
+    `<div class="cal-grid">` +
+    ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map(d=>`<div class="cal-dow">${d}</div>`).join("") +
+    cells + `</div>`;
+  $("#cal-range").textContent = `· ${anchor.toLocaleString(undefined,{month:"long",year:"numeric"})}`;
+
+  el.querySelectorAll(".cal-day.has").forEach(c => {
+    c.onclick = () => selectDay(c.dataset.day);
+  });
+}
+
+async function selectDay(day, quiet){
+  CAL_SEL = day;
+  if (!quiet) renderCalendar();
+  const box = $("#cal-detail");
+  box.innerHTML = `<div class="muted">loading ${day}…</div>`;
+  try {
+    const d = await get(`/analytics/day/${day}`);
+    const s = d.summary || {};
+    const types = Object.entries(d.by_type || {})
+      .sort((a,b) => b[1]-a[1])
+      .map(([k,v]) => `<span class="chip">${k.replace("_"," ")} <b>${v}</b></span>`).join("");
+    // "PPE violations", never "people": this store counts incidents, and SUM(hits) came out at
+    // 23,122 for 20 incidents when it was tried as a headcount proxy.
+    box.innerHTML = `
+      <div class="dhead">${new Date(day+"T12:00:00").toLocaleDateString(undefined,
+        {weekday:"long", day:"numeric", month:"long"})}</div>
+      <div class="drow">
+        <span class="chip acc">${s.n||0} <b>incidents</b></span>
+        <span class="chip">PPE violations <b>${s.ppe||0}</b></span>
+        <span class="chip">confirmed <b>${s.confirmed||0}</b></span>
+        <span class="chip">cameras <b>${s.cameras||0}</b></span>
+      </div>
+      <div class="drow">${types}</div>
+      <div class="cal-list">${(d.events||[]).slice(0,40).map(e => `
+        <div class="cal-item" data-id="${e.id}">
+          <span class="t">${e.timestamp.slice(11,19)}</span>
+          <span class="n">${e.sensor}</span>
+          <span>${e.label || e.type}</span>
+          <span class="t" style="margin-left:auto">${e.vlm_verdict}</span>
+        </div>`).join("") || '<div class="muted">no incidents</div>'}</div>`;
+    box.querySelectorAll(".cal-item").forEach(it => {
+      it.onclick = async () => {
+        const known = EVENTS.find(x => x.id === it.dataset.id);
+        if (known) return openClip(known);
+        try { openClip(await get(`/events/${it.dataset.id}`)); } catch {}
+      };
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="muted">could not load ${day}</div>`;
+  }
+}
+
+async function refreshCalendar(){
+  const d = await get("/analytics/calendar?days=120");
+  CAL = d.days || [];
+  $("#cal-tz").textContent = d.timezone ? `local (${d.timezone})` : "";
+  // Choose the default day BEFORE the first paint, so the most recent day is drawn already
+  // selected. Selecting it afterwards left the ring off until the operator clicked something.
+  const fresh = !CAL_SEL;
+  if (fresh && CAL.length) CAL_SEL = CAL[CAL.length - 1].d;
+  renderCalendar();
+  if (fresh && CAL_SEL) selectDay(CAL_SEL, true);
+}
+
+/* ---------- zone donut ----------
+   Which zones actually generate incidents. A donut rather than a bar chart because the question
+   is "what SHARE of our problem is this zone", and the total is meaningful — the categorical
+   palette is the same validated set as the line chart, capped at five slices plus Other because
+   past that the hues stop being separable for colour-blind readers. Every slice is also directly
+   labelled in the legend, so colour is never the only encoding. */
+const ZONE_COLORS = ["--s1","--s2","--s3","--s4","--s5","--s6"];
+
+function renderZones(rows, total){
+  const el = $("#zone-donut");
+  if (!rows.length) { el.innerHTML = '<p class="muted">no incidents yet</p>'; return; }
+  const top = rows.slice(0, 5);
+  const restN = rows.slice(5).reduce((a, r) => a + r.n, 0);
+  const slices = restN ? [...top, {z:"Other", n:restN}] : top;
+  const sum = slices.reduce((a,s) => a + s.n, 0) || 1;
+
+  const R = 62, r0 = 38, C = 74, TAU = Math.PI * 2;
+  let a0 = -Math.PI / 2, paths = "";
+  slices.forEach((s, i) => {
+    const frac = s.n / sum, a1 = a0 + frac * TAU;
+    const col = `var(${ZONE_COLORS[i % ZONE_COLORS.length]})`;
+    // A full circle cannot be drawn as one arc — it degenerates to a zero-length path and the
+    // slice vanishes. One zone holding 100% is the normal case early in a run.
+    if (frac > 0.999) {
+      paths += `<circle cx="${C}" cy="${C}" r="${(R+r0)/2}" fill="none"
+                        stroke="${col}" stroke-width="${R-r0}"/>`;
+    } else {
+      const p = (ang, rad) => [C + rad*Math.cos(ang), C + rad*Math.sin(ang)];
+      const [x0,y0] = p(a0,R), [x1,y1] = p(a1,R), [x2,y2] = p(a1,r0), [x3,y3] = p(a0,r0);
+      const big = frac > 0.5 ? 1 : 0;
+      paths += `<path d="M${x0} ${y0} A${R} ${R} 0 ${big} 1 ${x1} ${y1}
+                         L${x2} ${y2} A${r0} ${r0} 0 ${big} 0 ${x3} ${y3} Z"
+                      fill="${col}" stroke="var(--surface-1)" stroke-width="2"/>`;
+    }
+    a0 = a1;
+  });
+
+  el.innerHTML = `
+    <div class="donut-wrap">
+      <svg viewBox="0 0 148 148" width="148" height="148" role="img"
+           aria-label="incidents by zone">
+        ${paths}
+        <text x="${C}" y="${C-2}" text-anchor="middle" fill="var(--text-1)"
+              style="font-size:20px;font-weight:700">${total}</text>
+        <text x="${C}" y="${C+14}" text-anchor="middle" fill="var(--text-3)"
+              style="font-size:9px;letter-spacing:.06em">INCIDENTS</text>
+      </svg>
+      <div class="donut-legend">
+        ${slices.map((s,i) => `
+          <div class="dlg-row">
+            <span class="sw" style="background:var(${ZONE_COLORS[i % ZONE_COLORS.length]})"></span>
+            <span class="nm">${s.z}</span>
+            <span class="pc">${s.n} · ${Math.round(100*s.n/sum)}%</span>
+          </div>`).join("")}
+      </div>
+    </div>`;
+
+  // Composition per zone: PPE / overcrowding / fire+hazard as one bar each. Deliberately the
+  // same three colours everywhere on this card, assigned by TYPE — not by rank — so a zone
+  // dropping out of the top five cannot repaint the others.
+  const TYPE_COL = {ppe:"var(--s1)", crowd:"var(--s3)", danger:"var(--s2)"};
+  $("#zone-donut").insertAdjacentHTML("beforeend", `
+    <div class="zmix">
+      <div class="zmix-key">
+        <span><i class="sw" style="background:${TYPE_COL.ppe};width:9px;height:9px;border-radius:2px"></i>PPE</span>
+        <span><i class="sw" style="background:${TYPE_COL.crowd};width:9px;height:9px;border-radius:2px"></i>overcrowding</span>
+        <span><i class="sw" style="background:${TYPE_COL.danger};width:9px;height:9px;border-radius:2px"></i>fire / hazard</span>
+      </div>
+      ${rows.slice(0,6).map(r => {
+        const tot = Math.max(1, r.ppe + r.crowd + r.danger);
+        const seg = (n,c) => n ? `<i style="width:${100*n/tot}%;background:${c}"></i>` : "";
+        return `<div class="zmix-row">
+          <span class="zn" title="${r.z}">${r.z}</span>
+          <span class="zmix-bar">${seg(r.ppe,TYPE_COL.ppe)}${seg(r.crowd,TYPE_COL.crowd)}${seg(r.danger,TYPE_COL.danger)}</span>
+          <span class="zt">${r.n}</span>
+        </div>`;
+      }).join("")}
+    </div>`);
+
+  $("#zone-table").innerHTML = `<table><tr><th>zone</th><th>all</th><th>PPE</th>
+    <th>crowd</th><th>fire/hazard</th><th>confirmed</th></tr>` +
+    rows.map(r => `<tr><td>${r.z}</td><td>${r.n}</td><td>${r.ppe}</td><td>${r.crowd}</td>
+      <td>${r.danger}</td><td>${r.confirmed}</td></tr>`).join("") + `</table>`;
+}
+
+async function refreshZones(){
+  const d = await get("/analytics/zones");
+  $("#zone-total").textContent = `· ${d.total} incidents`;
+  renderZones(d.zones || [], d.total || 0);
+}
+
+const SERIES = [
+  {key:"gpu",label:"GPU",v:"--s1"}, {key:"cpu",label:"CPU",v:"--s2"},
+  {key:"nvdec",label:"NVDEC",v:"--s3"}, {key:"emc",label:"EMC",v:"--s4"},
+  {key:"ram",label:"RAM",v:"--s5"},
+];
+function lineChart(el, rows, series){
+  const W = el.clientWidth || 700, H = 200, P = {t:8,r:52,b:18,l:28};
+  if(!rows.length){ el.innerHTML = '<p class="muted">waiting for samples…</p>'; return; }
+  const t0 = rows[0].t, t1 = rows[rows.length-1].t || t0+1;
+  const x = t => P.l + (W-P.l-P.r)*((t-t0)/Math.max(1e-6,t1-t0));
+  const y = v => P.t + (H-P.t-P.b)*(1-Math.min(100,Math.max(0,v))/100);
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="System utilisation, last 5 minutes">`;
+  for(const g of [0,25,50,75,100]){
+    s += `<line x1="${P.l}" x2="${W-P.r}" y1="${y(g)}" y2="${y(g)}" stroke="var(--grid)" stroke-width="1"/>`;
+    s += `<text x="${P.l-6}" y="${y(g)+3.5}" text-anchor="end" font-size="10" fill="var(--text-3)">${g}</text>`;
+  }
+  // Labels are placed then nudged apart, so two series sitting at the same value do not
+  // overprint each other — the direct label is the secondary encoding that keeps identity
+  // available without relying on colour alone.
+  const lab = series.map(sr => ({sr, val: rows[rows.length-1][sr.key], y: y(rows[rows.length-1][sr.key])}))
+                    .sort((a,b) => a.y - b.y);
+  for(let i=1;i<lab.length;i++) if(lab[i].y - lab[i-1].y < 12) lab[i].y = lab[i-1].y + 12;
+  for(const sr of series){
+    const pts = rows.map(r => `${x(r.t).toFixed(1)},${y(r[sr.key]).toFixed(1)}`).join(" ");
+    s += `<polyline points="${pts}" fill="none" stroke="var(${sr.v})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  for(const L of lab)
+    s += `<text x="${W-P.r+6}" y="${L.y+3.5}" font-size="11" fill="var(--text-2)">${L.sr.label} ${L.val}%</text>`;
+  s += `<text x="${P.l}" y="${H-4}" font-size="10" fill="var(--text-3)">${new Date(t0*1000).toLocaleTimeString()}</text>`;
+  s += `<text x="${W-P.r}" y="${H-4}" font-size="10" fill="var(--text-3)" text-anchor="end">now</text></svg>`;
+  el.innerHTML = s;
+}
+function barChart(el, items){
+  if(!items.length){ el.innerHTML = '<p class="muted">no incidents yet</p>'; return; }
+  const max = Math.max(...items.map(d=>d.n),1), rowH = 19, W = el.clientWidth || 460, L = 54, R = 34;
+  let s = `<svg viewBox="0 0 ${W} ${items.length*rowH+6}" role="img" aria-label="Incidents per camera">`;
+  items.forEach((d,i)=>{
+    const w = Math.max(2,(W-L-R)*d.n/max), yy = i*rowH+3;
+    s += `<text x="${L-8}" y="${yy+11}" text-anchor="end" font-size="11" fill="var(--text-2)">${d.sensor}</text>`;
+    s += `<rect x="${L}" y="${yy}" width="${w}" height="${rowH-8}" rx="4" fill="var(--s1)"><title>${d.sensor}: ${d.n} incidents, ${d.high} high</title></rect>`;
+    s += `<text x="${L+w+6}" y="${yy+11}" font-size="11" fill="var(--text-2)">${d.n}</text>`;
+  });
+  el.innerHTML = s + "</svg>";
+}
+
+/* ---------- alarm: flashing + generated siren ----------
+   The tone is synthesised with Web Audio rather than loaded from a file, so the page stays
+   self-contained (no asset to fetch from a device with no internet). Browsers block audio until
+   a user gesture, hence the explicit sound toggle — silently failing to alarm would be worse
+   than asking for one click. */
+let AC = null, sirenTimer = null, soundOn = false;
+$("#btn-sound").onclick = () => {
+  soundOn = !soundOn;
+  if (soundOn && !AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  if (AC && AC.state === "suspended") AC.resume();
+  $("#btn-sound").textContent = soundOn ? "🔊 sound on" : "🔇 sound off";
+  if (soundOn) beep(880, .12, .05);
+};
+function beep(freq, dur, gain=0.12){
+  if(!AC || !soundOn) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = "sawtooth"; o.frequency.value = freq;
+  g.gain.setValueAtTime(0, AC.currentTime);
+  g.gain.linearRampToValueAtTime(gain, AC.currentTime + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+  o.connect(g).connect(AC.destination); o.start(); o.stop(AC.currentTime + dur + .02);
+}
+function startSiren(){
+  if (sirenTimer) return;
+  let hi = false;
+  sirenTimer = setInterval(() => { beep(hi ? 980 : 640, .34, .16); hi = !hi; }, 380);
+}
+function stopSiren(){ clearInterval(sirenTimer); sirenTimer = null; }
+
+let ALARM_EVENT = null;
+function raiseAlarm(e){
+  ALARM_EVENT = e;
+  $("#alarm-title").textContent = (e.label || "FIRE DETECTED").toUpperCase();
+  $("#alarm-meta").textContent = `${e.sensor} · ${e.zone || "no zone"} · ${e.timestamp.replace("T"," ").replace("Z","")}`;
+  $("#alarm-reason").textContent = e.vlm_reason || "";
+  $("#alarm").classList.add("on");
+  // A browser will not play audio until the user has interacted with the page, so an alarm can
+  // be visually screaming while silent. Saying so — with the fix one click away, inside the
+  // dialog the operator is already looking at — beats leaving them to wonder whether the siren
+  // is broken. (It is not: verified 36 oscillators started during a live alarm.)
+  $("#alarm-sound").hidden = soundOn;
+  startSiren();
+  if (navigator.vibrate) navigator.vibrate([300,120,300,120,600]);
+}
+$("#alarm-sound").onclick = () => {
+  $("#btn-sound").click();          // one place owns the AudioContext lifecycle
+  $("#alarm-sound").hidden = soundOn;
+  if (soundOn) { stopSiren(); startSiren(); }   // restart so it beeps immediately
+};
+$("#alarm-ack").onclick = () => { $("#alarm").classList.remove("on"); stopSiren(); };
+$("#alarm-view").onclick = () => { $("#alarm").classList.remove("on"); stopSiren(); if (ALARM_EVENT) openClip(ALARM_EVENT); };
+
+/* ---------- toasts ---------- */
+function toast(e, opts){
+  const ongoing = opts && opts.ongoing;
+  const sticky = (opts && opts.sticky) || (e.severity === "critical" && !ongoing);
+  const el = document.createElement("div");
+  el.className = "toast " + (e.severity || "")
+               + (opts && opts.sticky ? " hazard" : "") + (ongoing ? " ongoing" : "");
+  // A VLM-raised hazard is asking the operator to look at footage, so the toast says what was
+  // seen and that clicking opens the clip. A bare severity label would not earn the interruption.
+  const why = (opts && opts.sticky && e.vlm_reason) ? e.vlm_reason.slice(0, 110) : "";
+  el.innerHTML = `<div class="t">${ongoing ? "STILL OPEN · " : ""}${e.sensor} · ${e.label || e.type}</div>
+                  <div class="b">${ongoing && e.open_minutes != null ? `unresolved for ${Math.round(e.open_minutes)} min · ` : ""}${e.zone || "no zone"} · ${e.severity}${e.vlm_verdict && e.vlm_verdict!=="unverified" ? " · "+e.vlm_verdict : ""}</div>`
+                  + (why ? `<div class="b">${why}</div><div class="b">click to view the clip</div>` : "");
+  el.onclick = () => openClip(e);
+  $("#toasts").appendChild(el);
+  beep(e.severity === "critical" ? 760 : 520, .1, .07);
+  // Critical and hazard alerts do not auto-dismiss: an operator must actively clear them.
+  if (!sticky)
+    setTimeout(() => { el.classList.add("out"); setTimeout(()=>el.remove(), 260); }, 7000);
+}
+
+/* ---------- live view over WebRTC (WHEP) ----------
+   Browsers cannot play RTSP. mediamtx republishes the same stream as WebRTC; this negotiates
+   WHEP directly rather than embedding mediamtx's own page, so the video sits inside the layout
+   and there is no iframe to style around. */
+const WHEP_PORT = 8889, HLS_PORT = 8888, PATHNAME = "safety";
+let pc = null;
+
+/* A black video box has three different causes — mediamtx down, mediamtx up but nobody
+   publishing, or the viewer's own WebRTC failing — and they need three different fixes.
+   /live/status separates them so the placeholder states the actual reason and offers the one
+   button that resolves it, instead of a generic "start" that may do nothing. */
+let LIVE = null;
+async function checkLive(){
+  try { LIVE = await get("/live/status"); }
+  catch { LIVE = { ready:false, reason:"the API is unreachable", action:null }; }
+  const btn = $("#btn-rtsp-start");
+  if (LIVE.ready) {
+    $("#live-reason").textContent = "Path is live — connecting…";
+    $("#live-action").textContent = ""; btn.hidden = true;
+    return true;
+  }
+  $("#live-reason").textContent = "No picture — " + (LIVE.reason || "reason unknown");
+  $("#live-action").textContent = LIVE.action ? "Fix: " + LIVE.action : "";
+  btn.hidden = false;
+  // The publisher is a pipeline start-time flag — an encoder cannot be attached to a running
+  // DeepStream graph — so enabling live view really does restart it. The button label says so
+  // rather than restarting the operator's running analytics behind a friendly word.
+  btn.textContent = !LIVE.server ? "Start RTSP server"
+                  : (LIVE.pipeline_running && !LIVE.pipeline_rtsp_out)
+                    ? "Restart pipeline with live output"
+                    : "Start pipeline with live output";
+  return false;
+}
+
+async function connectWhep(){
+  const host = location.hostname;
+  $("#live-mode").textContent = "· connecting…";
+  try {
+    pc = new RTCPeerConnection({ iceServers: [] });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.ontrack = ev => { $("#live-video").srcObject = ev.streams[0]; $("#live-ph").style.display = "none"; };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const r = await fetch(`http://${host}:${WHEP_PORT}/${PATHNAME}/whep`, {
+      method: "POST", headers: { "Content-Type": "application/sdp" }, body: offer.sdp });
+    if (!r.ok) throw new Error("WHEP " + r.status);
+    await pc.setRemoteDescription({ type: "answer", sdp: await r.text() });
+    $("#live-mode").textContent = "· WebRTC";
+  } catch (err) {
+    // HLS is the documented fallback: higher latency, but it plays where WebRTC autoplay is
+    // blocked (notably iOS Safari).
+    $("#live-mode").textContent = "· HLS fallback";
+    const v = $("#live-video");
+    v.src = `http://${host}:${HLS_PORT}/${PATHNAME}/index.m3u8`;
+    v.play().then(() => $("#live-ph").style.display = "none")
+            .catch(() => { $("#live-mode").textContent = "· unavailable"; $("#live-ph").style.display = "grid"; });
+  }
+}
+
+async function startLive(){
+  $("#live-ph").style.display = "grid";
+  if (await checkLive()) connectWhep();
+}
+
+$("#btn-live").onclick = () => {
+  const card = $("#live-card");
+  card.hidden = !card.hidden;
+  if (!card.hidden && !pc) startLive();
+};
+
+/* Fullscreen the wall. Twenty tiles inside a dashboard card are ~180px wide each, which is not
+   enough to see a bounding box, let alone read the OSD. Fullscreen is what makes the live view
+   usable as a monitoring wall rather than a thumbnail. */
+function toggleFullscreen(){
+  const el = $("#live-wrap");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();  // Safari
+}
+$("#btn-fs").onclick = e => { e.stopPropagation(); toggleFullscreen(); };
+$("#live-wrap").addEventListener("dblclick", toggleFullscreen);
+document.addEventListener("fullscreenchange", () => {
+  $("#btn-fs").textContent = document.fullscreenElement ? "⛶ exit fullscreen" : "⛶ fullscreen";
+});
+
+$("#btn-rtsp-start").onclick = async () => {
+  const btn = $("#btn-rtsp-start"), was = btn.textContent;
+  btn.disabled = true; btn.textContent = "working…";
+  try {
+    if (!LIVE.server) {
+      await fetch("/rtsp/on", { method: "POST" });
+    } else {
+      // Restarting is what the operator asked for by pressing a button that says "restart".
+      if (LIVE.pipeline_running) await fetch("/pipeline/stop", { method: "POST" });
+      await fetch("/pipeline/start?rtsp_out=true", { method: "POST" });
+    }
+  } catch (e) { /* checkLive below reports the resulting state */ }
+  btn.disabled = false; btn.textContent = was;
+  // The encode branch needs a moment to publish before the path reports ready.
+  setTimeout(startLive, 3000);
+};
+
+/* ---------- data ---------- */
+async function refreshHealth(){
+  try{
+    const h = await get("/health");
+    $("#d-pipe").className = "dot " + (h.pipeline?"up":"down");
+    $("#d-vlm").className  = "dot " + (h.vlm?"up":"down");
+    $("#d-llm").className  = "dot " + (h.agent_llm?"up":"down");
+    const st = await get("/pipeline/status");
+    const diff = st.config_differs ? ` (cfg ${st.configured.streams})` : "";
+    $("#p-fps").textContent = st.running
+      ? `${st.streams} streams${diff} · ${st.analytics_fps_per_stream} fps · target ${st.realtime_target_fps}`
+      : `stopped · configured ${st.configured.streams}`;
+  }catch(e){}
+}
+const PREV = {};
+async function refreshKpis(){
+  const [s, cams] = await Promise.all([get("/analytics/summary"), get("/analytics/cameras")]);
+  const conf = s.by_verdict?.confirmed||0, rej = s.by_verdict?.rejected||0, adj = conf+rej;
+  const tiles = [
+    {k:"inc",  v:s.incidents, l:"incidents", sub:`${s.open} still open`},
+    {k:"high", v:s.by_severity?.high||0, l:"high severity", sub:`${s.by_severity?.medium||0} medium`},
+    {k:"conf", v:conf, l:"VLM confirmed", sub:`${rej} rejected as false positives`},
+    {k:"prec", v: adj? Math.round(100*conf/adj)+"%" : "—", l:"confirmed share", sub:`of ${adj} adjudicated`},
+    {k:"cams", v:s.cameras_affected, l:"cameras affected", sub:`${s.with_clips} with clips`},
+  ];
+  $("#kpis").innerHTML = tiles.map(t =>
+    `<div class="card kpi"><div class="v" data-k="${t.k}">${t.v}</div><div class="l">${t.l}</div><div class="sub">${t.sub}</div></div>`).join("");
+  // Animate only the numbers that actually changed — a dashboard where everything pulses on
+  // every poll trains the eye to ignore movement.
+  tiles.forEach(t => { if (PREV[t.k] !== undefined && PREV[t.k] !== t.v)
+      document.querySelector(`.v[data-k="${t.k}"]`)?.classList.add("bump");
+    PREV[t.k] = t.v; });
+  barChart($("#cam-chart"), cams.cameras.filter(c=>c.n>0));
+}
+async function refreshSystem(){
+  const m = await get("/metrics/system?minutes=5&max_points=240");
+  if(m.error){ $("#sys-chart").innerHTML = `<p class="muted">tegrastats: ${m.error}</p>`; return; }
+  $("#sys-legend").innerHTML = SERIES.map(s=>`<span><i class="sw" style="background:var(${s.v})"></i>${s.label}</span>`).join("");
+  lineChart($("#sys-chart"), m.history, SERIES);
+  const c = m.current||{};
+  $("#sys-table").innerHTML = `<table><tr><th>metric</th><th>now</th></tr>` +
+    SERIES.map(s=>`<tr><td>${s.label}</td><td>${fmt(c[s.key])}%</td></tr>`).join("") +
+    `<tr><td>RAM used</td><td>${fmt(c.ram_used_mb)} / ${fmt(c.ram_total_mb)} MB</td></tr>
+     <tr><td>Temp (tj)</td><td>${fmt(c.temp_tj)} °C</td></tr>
+     <tr><td>Power</td><td>${fmt(c.power_mw)} mW</td></tr></table>`;
+}
+// id -> {hits, ended}, not a bare Set: a merged/reopened incident keeps its id, so identity
+// alone cannot tell you whether anything happened to it.
+let EVENTS = [], SEEN = new Map(), primed = false;
+function renderFeed(fresh){
+  $("#feed").innerHTML = EVENTS.map(e => `
+    <div class="ev ${fresh && fresh.has(e.id) ? "fresh" : ""}" data-id="${e.id}">
+      <div class="sev ${e.severity}"></div>
+      <div><div class="ttl">${e.sensor} · ${e.label || e.type}</div>
+        <div class="meta">${e.timestamp.replace("T"," ").replace("Z","")} · ${e.zone||"no zone"}${e.duration_s?" · "+e.duration_s+"s":""}${
+          (e.reminder_count||0) > 0 && e.open_minutes != null
+            ? ` · <span class="ongoing-tag">still open ${Math.round(e.open_minutes)} min</span>` : ""}</div></div>
+      <div><span class="tag ${e.vlm_verdict}">${e.vlm_verdict}</span></div>
+      ${e.vlm_reason?`<div class="reason">${e.vlm_reason.slice(0,150)}</div>`:""}
+    </div>`).join("") || '<p class="muted">no incidents yet</p>';
+}
+async function refreshFeed(){
+  const d = await get("/events?limit=40");
+  const fresh = new Set();
+  for (const e of d.events) {
+    const prev = SEEN.get(e.id);
+    // An incident is not only news when it is NEW. Incidents are transitions and they MERGE:
+    // a second fire on a camera that already has an open fire incident increments `hits` and
+    // reopens it rather than inserting a row. Alarming only on unseen ids meant the second fire
+    // on a camera was silent — which is exactly how the "test fire" button appeared broken, and
+    // would equally have silenced a real fire that flared up again after clearing.
+    // Restricted to fire on purpose. PPE and overcrowding incidents merge continuously — at 20
+    // streams `hits` climbs on almost every poll as people join an ongoing situation, which is
+    // not news and would leave the whole feed flashing. A fire re-igniting is news.
+    const flared = prev && e.type === "fire_alert"
+                   && (e.hits > prev.hits || (prev.ended && !e.ended));
+    // A still-open incident re-raised past the threshold is news again, for any type: the whole
+    // point is that a situation nobody resolved should not go quiet. It re-toasts (never the
+    // full fire alarm — nothing NEW happened, it simply has not stopped).
+    const reraised = prev && (e.reminder_count || 0) > (prev.reminders || 0);
+    if (!prev || flared || reraised) {
+      SEEN.set(e.id, {hits: e.hits, ended: e.ended, reminders: e.reminder_count || 0});
+      // `primed` suppresses a burst of toasts for history already on screen at first load —
+      // only genuinely new incidents should announce themselves.
+      if (primed) {
+        fresh.add(e.id);
+        // Fire gets the full alarm — flash, siren, modal. A hazard the VLM spotted gets a
+        // sticky toast the operator has to dismiss: it is a request to LOOK at a clip, not an
+        // adjudicated verdict, so it must not be as easy to miss as a routine PPE toast nor as
+        // absolute as the fire alarm.
+        if (reraised) toast(e, {ongoing: true});
+        else if (e.type === "fire_alert") raiseAlarm(e);
+        else if (e.type === "hazard_alert") toast(e, {sticky: true});
+        else toast(e);
+      }
+    } else if (prev) {
+      // Keep the baseline current so a later comparison is against what we last saw.
+      SEEN.set(e.id, {hits: e.hits, ended: e.ended, reminders: e.reminder_count || 0});
+    }
+  }
+  primed = true;
+  EVENTS = d.events;
+  renderFeed(fresh);
+}
+
+/* ---------- clip dialog ----------
+   The alarm fires ~0.3 s after the incident is stored; the evidence clip takes ~2-3 s to cut.
+   So the event object captured when the alarm was raised NEVER has a clip yet, and "View clip"
+   on the alarm always opened an empty dialog — while clicking the same incident in the feed a
+   moment later worked, because the feed had been re-rendered from fresh rows.
+
+   Two fixes, both here: always re-resolve the incident from the latest data rather than trusting
+   the captured object, and if the clip genuinely is not cut yet, WAIT for it in the dialog
+   instead of declaring it missing. "Missing" and "not ready yet" are different facts and only
+   one of them is permanent. */
+let clipWatch = null;
+
+function renderClip(e){
+  $("#dlg-title").textContent = `${e.sensor} · ${e.label || e.type}`;
+  $("#dlg-meta").textContent = `${e.timestamp} · ${e.zone||"no zone"} · ${e.severity} · ${e.vlm_verdict}`;
+  $("#dlg-reason").textContent = e.vlm_reason || "";
+  const v = $("#dlg-video");
+  if (e.clip_url) {
+    if (v.getAttribute("src") !== e.clip_url) v.src = e.clip_url;
+    v.style.display = "";
+    // Seek a little way in so the dialog opens on a real frame instead of black. `preload=
+    // "metadata"` fetches the header but decodes nothing, and a clip that looks empty until you
+    // press play reads as a broken clip — which is exactly how a genuinely missing one looked.
+    v.onloadedmetadata = () => { try { v.currentTime = Math.min(1.5, (v.duration || 3) / 3); } catch {} };
+    $("#dlg-noclip").hidden = true;
+    return true;
+  }
+  v.removeAttribute("src");
+  v.style.display = "none";
+  $("#dlg-noclip").hidden = false;
+  $("#dlg-noclip").textContent =
+    e.clip_state === "expired"
+      ? "The evidence clip has aged out under the retention policy; the incident record remains."
+      : e.clip_state === "skipped"
+        ? "No evidence clip: this incident carried no source timestamp, so it could not be "
+          + "located in the recording. Injected test alerts are the usual case."
+        : "Cutting the evidence clip… it appears here as soon as it is ready (usually 2-3 s).";
+  return false;
+}
+
+function openClip(e){
+  // The freshest copy wins: the caller may be holding an object from seconds ago.
+  e = EVENTS.find(x => x.id === e.id) || e;
+  $("#dlg").dataset.id = e.id;
+  const ready = renderClip(e);
+  $("#dlg").showModal();
+
+  clearInterval(clipWatch); clipWatch = null;
+  if (ready || e.clip_state === "expired" || e.clip_state === "skipped") return;
+  // Poll this one incident until its clip lands. Bounded, and cleared when the dialog closes, so
+  // a permanently clip-less incident cannot leave a timer running.
+  let tries = 0;
+  clipWatch = setInterval(async () => {
+    if (!$("#dlg").open || ++tries > 14) { clearInterval(clipWatch); clipWatch = null; return; }
+    try {
+      const fresh = await get(`/events/${e.id}`);
+      if (renderClip(fresh)) { clearInterval(clipWatch); clipWatch = null; }
+    } catch { /* keep waiting; a blip is not an answer */ }
+  }, 1500);
+}
+$("#feed").addEventListener("click", ev => {
+  const row = ev.target.closest(".ev"); if(!row) return;
+  const e = EVENTS.find(x=>x.id===row.dataset.id); if(e) openClip(e);
+});
+$("#dlg-close").onclick = () => {
+  $("#dlg-video").pause(); $("#dlg").close();
+  clearInterval(clipWatch); clipWatch = null;   // never outlive the dialog
+};
+// Esc closes a <dialog> without going through the button, so stop the watcher there too.
+$("#dlg").addEventListener("close", () => { clearInterval(clipWatch); clipWatch = null; });
+async function verify(verdict){
+  const id = $("#dlg").dataset.id; if(!id) return;
+  await fetch(`/events/${id}/verify?verdict=${verdict}&note=${encodeURIComponent("via dashboard")}`, {method:"POST"});
+  $("#dlg-video").pause(); $("#dlg").close(); refreshFeed(); refreshKpis();
+}
+$("#dlg-confirm").onclick = ()=>verify("confirmed");
+$("#dlg-reject").onclick  = ()=>verify("rejected");
+$("#btn-testfire").onclick = async (e) => { e.stopPropagation(); await fetch("/alerts/test?type=fire_alert&camera=7",{method:"POST"}); };
+
+/* ---------- agent ---------- */
+const HISTORY = [];
+
+/* Per-camera counts, split by verdict, from the aggregate the API returns. Only the cameras that
+   actually appear are listed — a row of zeroes for every configured camera would bury the answer.
+   The filter line matters: "13" and "23" are both true totals of different sets, and a count
+   without its predicate is exactly how a right number becomes a wrong answer. */
+/* Clips the agent returned, as players. Answering "show me the clip" with a paragraph is not
+   showing anything, and the operator's next move is always to look at the footage. Muted and
+   preload=metadata so several can sit in a chat bubble without fetching megabytes each; clicking
+   opens the full dialog with the verdict controls. */
+function clipStrip(rows){
+  return `<div class="clips">` + rows.slice(0, 4).map(r => `
+    <figure class="clipcard" data-id="${r.id}">
+      <video src="${r.clip_url}" muted playsinline preload="metadata"></video>
+      <figcaption>${r.sensor} · ${r.type}${r.zone ? " · " + r.zone : ""}${
+        r.vlm_verdict && r.vlm_verdict !== "unverified" ? " · " + r.vlm_verdict : ""}</figcaption>
+    </figure>`).join("") + `</div>`;
+}
+
+function countsTable(c){
+  const cams = Object.keys(c.by_camera || {});
+  if (!cams.length) return "";
+  const verdicts = ["confirmed","rejected","unverified"].filter(
+    v => Object.keys(c.by_camera_verdict || {}).some(k => k.endsWith("/" + v)));
+  const cell = (cam, v) => (c.by_camera_verdict || {})[`${cam}/${v}`] || 0;
+  const filters = c.filters && Object.keys(c.filters).length
+    ? Object.entries(c.filters).map(([k,v])=>`${k}=${v}`).join(" · ")
+    : "all incidents";
+  return `<div class="counts">
+    <div class="counts-cap">counts from the database · ${filters} · total ${c.incidents}</div>
+    <table><thead><tr><th>camera</th>${verdicts.map(v=>`<th>${v}</th>`).join("")}<th>all</th></tr></thead>
+    <tbody>${cams.map(cam=>`<tr><td>${cam}</td>${
+      verdicts.map(v=>`<td>${cell(cam,v)||"·"}</td>`).join("")
+    }<td>${c.by_camera[cam]}</td></tr>`).join("")}</tbody></table></div>`;
+}
+$("#chat-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const q = $("#q").value.trim(); if(!q) return;
+  $("#q").value = "";
+  const msgs = $("#msgs");
+  msgs.insertAdjacentHTML("beforeend", `<div class="msg u">${q}</div>`);
+  const p = document.createElement("div"); p.className="msg a"; p.textContent="thinking…";
+  msgs.appendChild(p); msgs.scrollTop = msgs.scrollHeight;
+  try{
+    const r = await fetch("/agent/chat", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({question:q, history:HISTORY.slice(-3)})});
+    const d = await r.json();
+    p.textContent = d.answer;
+    // The prose is the model's; the numbers are SQL. Shown as a table because a language model
+    // asked to enumerate nine cameras from a payload reliably narrates three of them — the
+    // narrative stays readable and the exact counts sit underneath it, where they can be checked.
+    //
+    // Only for AGGREGATE questions, though. Retrieval carries the same counts so the model never
+    // has to do arithmetic, but rendering them under every answer put a 20-row breakdown of all
+    // incidents under "any dangerous incidents today?" — noise that reads as if it supports an
+    // answer it has nothing to do with. `get_summary` is the planner saying the question was a
+    // counting one; that is the right signal to show the table.
+    if (d.counts && d.tool === "get_summary")
+      p.insertAdjacentHTML("beforeend", countsTable(d.counts));
+    // Clips the agent found: playable, not just described. "show me the clip" answering with
+    // prose and no video is the complaint this fixes.
+    const clips = (d.incidents || []).filter(r => r.clip_url);
+    if (clips.length) p.insertAdjacentHTML("beforeend", clipStrip(clips));
+    if(d.cited_ids?.length)
+      p.insertAdjacentHTML("beforeend", `<span class="cite">cited: ${d.cited_ids.map(c=>c.slice(0,8)).join(", ")} · via ${d.tool}</span>`);
+    // Seek each thumbnail a little way in: a clip's first frame is often black, and four black
+    // rectangles look like four broken clips.
+    p.querySelectorAll(".clipcard video").forEach(v => {
+      v.onloadedmetadata = () => { try { v.currentTime = Math.min(1.5, (v.duration||3)/3); } catch {} };
+    });
+    // Clicking a thumbnail opens the same dialog the feed uses, so the verdict buttons and the
+    // full description are one place, not two.
+    p.querySelectorAll(".clipcard").forEach(card => {
+      card.onclick = async () => {
+        const id = card.dataset.id;
+        const known = EVENTS.find(x => x.id.startsWith(id));
+        if (known) return openClip(known);
+        try { openClip(await get(`/events/${id}`)); } catch {}
+      };
+    });
+    HISTORY.push({q, a:d.answer});
+  }catch(err){ p.textContent = "agent unavailable: " + err.message; }
+  // Scroll to the TOP of the answer, not the bottom of the box. An answer carrying a counts table
+  // is taller than the panel, and scrolling to the bottom lands past the answer itself — the
+  // reader arrives at the last table row having never seen the sentence it belongs to.
+  msgs.scrollTop = Math.min(p.offsetTop - msgs.offsetTop, msgs.scrollHeight);
+});
+
+$("#btn-theme").onclick = () => {
+  const d = document.documentElement.getAttribute("data-theme") === "dark";
+  document.documentElement.setAttribute("data-theme", d ? "light" : "dark");
+  refreshSystem();
+};
+
+try {
+  const ws = new WebSocket((location.protocol==="https:"?"wss://":"ws://") + location.host + "/events/stream");
+  ws.onmessage = () => { refreshFeed(); refreshKpis(); };
+} catch(e) {}
+
+function safe(fn){ return () => fn().catch(()=>{}); }
+safe(refreshHealth)(); safe(refreshKpis)(); safe(refreshSystem)(); safe(refreshFeed)();
+safe(refreshCalendar)(); safe(refreshZones)();
+setInterval(safe(refreshSystem), 2000);
+setInterval(safe(refreshKpis), 10000);
+setInterval(safe(refreshFeed), 8000);
+setInterval(safe(refreshHealth), 5000);
+// Slower: a day's totals and a zone breakdown do not change meaningfully between ticks, and
+// re-rendering the calendar under the cursor would fight the operator's selection.
+setInterval(safe(refreshZones), 20000);
+setInterval(safe(refreshCalendar), 30000);
+// Redraw the SVG charts on resize — they are sized from clientWidth at render time, so a window
+// change otherwise leaves them at the old width until the next poll.
+let resizeT = null;
+addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { safe(refreshSystem)(); safe(refreshZones)(); }, 250);
+});
+addEventListener("resize", safe(refreshSystem));
+</script>
+</body>
+</html>

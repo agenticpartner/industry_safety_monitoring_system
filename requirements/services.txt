@@ -1,0 +1,10 @@
+# build/venv-services — everything downstream of the pipeline.
+#
+# Kept OUT of system python on purpose: that is where pyservicemaker lives, the pipeline imports
+# it, and nothing may be installed alongside it. app/events.py is dependency-free for the same
+# reason — it speaks RESP over a plain socket rather than importing this redis client.
+fastapi>=0.115
+uvicorn[standard]>=0.30        # [standard] pulls in the websockets impl the dashboard feed needs
+redis>=5.0
+PyYAML>=6.0
+Pillow>=10.0                   # tools/verify_verdicts.py contact sheets only

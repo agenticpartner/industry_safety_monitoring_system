@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System — Industry Safety Operations Monitoring</title>
+<!--
+  Developer reference for the running system: hardware, models, engines, measured throughput and
+  latency, and how the pieces connect.
+
+  Every number here is measured on this device — none are datasheet figures or estimates, and
+  where a measurement contradicts the datasheet (NVDEC decode) the page gives both and says
+  which is which.
+
+  Audience is a developer evaluating the SYSTEM: what the hardware does, which models run, how
+  they are configured, what it costs and how the parts connect. Not the codebase — no repository
+  paths, no build tooling, no history of how any of it was arrived at.
+
+  Deliberately static. It is a reference to read, not a monitor to watch — the dashboard next
+  door is the live view, and mixing the two would leave a reader unsure which numbers are
+  history and which are now.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0f1b33; --surface-1:#1b2c4e; --surface-2:#23375d; --surface-3:#2c4270;
+    --border:#2b4272; --border-2:#3b568f;
+    --text-1:#eef2fa; --text-2:#a9b6d0; --text-3:#7385a6;
+    --accent:#f2b705; --accent-2:#ffd466;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#9085e9;
+    --ok:#2ecc8f; --warning:#e0a02a; --critical:#ff5d55;
+  }
+  @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation:none!important; transition:none!important; } }
+  * { box-sizing:border-box; }
+  html,body { margin:0; }
+  body {
+    background:var(--bg); color:var(--text-1);
+    font:14px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  header {
+    position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    padding:13px 20px; background:rgba(15,27,51,.92); backdrop-filter:blur(9px);
+    border-bottom:1px solid var(--border);
+  }
+  h1 { font-size:17px; margin:0; letter-spacing:-.01em; font-weight:650; }
+  h1 em { font-style:normal; color:var(--accent); }
+  .back {
+    margin-left:auto; font-size:12px; color:var(--text-2); text-decoration:none;
+    border:1px solid var(--border-2); border-radius:9px; padding:6px 12px; background:var(--surface-2);
+  }
+  .back:hover { border-color:var(--accent); color:var(--text-1); }
+  main { max-width:1180px; margin:0 auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+  .card {
+    background:var(--surface-1); border:1px solid var(--border); border-radius:13px; padding:16px 18px;
+  }
+  h2 {
+    font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--text-3);
+    margin:0 0 12px; font-weight:600; display:flex; align-items:center; gap:8px;
+  }
+  h2::before { content:""; width:3px; height:13px; border-radius:2px; background:var(--accent); flex:none; }
+  h3 { font-size:13px; margin:16px 0 7px; color:var(--text-1); font-weight:620; }
+  p { margin:0 0 10px; color:var(--text-2); }
+  .lede { color:var(--text-2); font-size:13px; }
+  .cols2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:6px 10px 6px 0; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { color:var(--accent); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  td:first-child, th:first-child { text-align:left; color:var(--text-1); }
+  td { color:var(--text-2); }
+  tr:last-child td { border-bottom:none; }
+  .wrap { overflow-x:auto; }
+  code, .mono { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; }
+  code { background:var(--surface-2); border:1px solid var(--border); border-radius:5px; padding:1px 5px; color:var(--accent-2); }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:5px 14px; font-size:13px; }
+  .kv dt { color:var(--text-3); }
+  .kv dd { margin:0; color:var(--text-1); }
+  .note {
+    border-left:3px solid var(--accent); background:var(--surface-2); border-radius:0 8px 8px 0;
+    padding:9px 13px; font-size:12.5px; color:var(--text-2); margin:10px 0;
+  }
+  .note b { color:var(--accent-2); }
+  .tag {
+    display:inline-block; font-size:10.5px; padding:2px 8px; border-radius:999px;
+    border:1px solid var(--border-2); color:var(--text-2); background:var(--surface-2);
+  }
+  .tag.ok { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 45%, transparent); }
+  .tag.warn { color:var(--warning); border-color:color-mix(in srgb, var(--warning) 45%, transparent); }
+  .big { font-size:26px; font-weight:680; letter-spacing:-.02em; color:var(--accent); line-height:1.15;
+         font-variant-numeric:tabular-nums; }
+  .stat { background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:11px 13px; }
+  .stat .l { font-size:11.5px; color:var(--text-3); margin-top:2px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:11px; }
+  svg { display:block; max-width:100%; }
+  footer { color:var(--text-3); font-size:12px; padding:6px 20px 30px; text-align:center; }
+  a { color:var(--accent-2); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🧠 System <em>Reference</em></h1>
+  <span class="tag">measured on this device</span>
+  <a class="back" href="/">← back to dashboard</a>
+</header>
+
+<main>
+
+  <section class="card">
+    <h2>What this is</h2>
+    <p class="lede">
+      A 20-camera industrial safety pipeline running entirely on one Jetson AGX Orin: PPE and
+      fire/smoke detection on every stream, zone analytics, a vision-language model that reviews
+      each incident, and a language model that answers questions about them. Nothing leaves the
+      device except the alerts you choose to send.
+    </p>
+    <div class="stats" style="margin-top:12px">
+      <div class="stat"><div class="big">20</div><div class="l">1080p30 H.265 streams</div></div>
+      <div class="stat"><div class="big">633.7</div><div class="l">fps end-to-end (600 needed)</div></div>
+      <div class="stat"><div class="big">0.27 s</div><div class="l">detection → alert (p50)</div></div>
+      <div class="stat"><div class="big">4</div><div class="l">neural networks, concurrent</div></div>
+    </div>
+  </section>
+
+  <div class="cols2">
+    <section class="card">
+      <h2>Hardware &amp; platform</h2>
+      <dl class="kv">
+        <dt>Board</dt><dd>Jetson AGX Orin Developer Kit, 64 GB, aarch64</dd>
+        <dt>L4T / JetPack</dt><dd>R39.2.1 / 7.2.1-b49</dd>
+        <dt>DeepStream</dt><dd>9.1.0</dd>
+        <dt>TensorRT</dt><dd>10.16.2.10 (CUDA 13.2)</dd>
+        <dt>GStreamer</dt><dd>1.24.2</dd>
+        <dt>Accelerators</dt><dd>GPU · 2× DLA (nvdla0/1) · 2× PVA · NVDEC · NVENC</dd>
+        <dt>Power mode</dt><dd>MAXN, clocks locked for benchmarking</dd>
+      </dl>
+      <div class="note">
+        <b>DLA is unused, deliberately.</b> A model is placed on DLA only if it compiles without
+        <code>--allowGPUFallback</code>. A graph split between DLA and GPU ping-pongs tensors at
+        every subgraph boundary and is typically slower than pure GPU while appearing to "use
+        DLA". Neither detector qualifies, so both run on the GPU.
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Decode ceiling <span class="tag warn">contradicts the datasheet</span></h2>
+      <p>NVDEC saturates and then divides its fixed capacity among however many streams ask for
+         it — so the ceiling is a throughput number, not a stream count.</p>
+      <div class="wrap"><table>
+        <tr><th>Measurement</th><th>Value</th></tr>
+        <tr><td>NVDEC aggregate, 1080p30 H.265</td><td>~1102 fps</td></tr>
+        <tr><td>Implied concurrent streams</td><td>~36</td></tr>
+        <tr><td>AGX Orin datasheet figure</td><td>22</td></tr>
+        <tr><td>Used by this demo</td><td>20</td></tr>
+      </table></div>
+      <div class="note">
+        The datasheet's 22 is a conservative product-spec figure; measured throughput on this
+        JetPack 7.2 / L4T R39.2 build is higher. The demo still uses 20 because
+        <b>the GPU, not the decoder, is the real limit</b> — at 20 streams NVDEC sits well inside
+        its ceiling while the GPU is at 99%. H.265 is not optional: H.264 has a materially lower
+        ceiling and will not hold 20 streams.
+      </div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Pipeline</h2>
+    <p class="lede">One DeepStream graph, built with <code>pyservicemaker</code>. Detection runs
+       batched across all cameras; everything after the tracker is per-frame metadata work.</p>
+    <div class="wrap">
+      <svg viewBox="0 0 1120 300" width="1120" height="300" role="img"
+           aria-label="pipeline block diagram">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="#7385a6"/>
+          </marker>
+          <style>
+            .b { fill:#23375d; stroke:#3b568f; rx:8; }
+            .bx { fill:#2c4270; stroke:#f2b705; }
+            .t { fill:#eef2fa; font:12px ui-sans-serif, system-ui; }
+            .ts { fill:#7385a6; font:10px ui-sans-serif, system-ui; }
+            .ln { stroke:#7385a6; stroke-width:1.5; fill:none; marker-end:url(#a); }
+            .lnd { stroke:#f2b705; stroke-width:1.5; fill:none; stroke-dasharray:4 3; marker-end:url(#a); }
+          </style>
+        </defs>
+
+        <rect class="b" x="8"   y="60"  width="104" height="52"/>
+        <text class="t"  x="26"  y="82">20× source</text>
+        <text class="ts" x="26"  y="98">file / RTSP</text>
+
+        <rect class="b" x="140" y="60"  width="104" height="52"/>
+        <text class="t"  x="158" y="82">nvstreammux</text>
+        <text class="ts" x="158" y="98">batch = 20</text>
+
+        <rect class="bx" x="272" y="30"  width="112" height="52"/>
+        <text class="t"  x="290" y="52">nvinfer PPE</text>
+        <text class="ts" x="290" y="68">FP16 · every frame</text>
+
+        <rect class="bx" x="272" y="102" width="112" height="52"/>
+        <text class="t"  x="290" y="124">nvinfer fire</text>
+        <text class="ts" x="290" y="140">FP16 · every 2nd</text>
+
+        <rect class="b" x="412" y="60"  width="104" height="52"/>
+        <text class="t"  x="430" y="82">nvtracker</text>
+        <text class="ts" x="430" y="98">NvSORT tuned</text>
+
+        <rect class="b" x="544" y="60"  width="112" height="52"/>
+        <text class="t"  x="562" y="82">nvdsanalytics</text>
+        <text class="ts" x="562" y="98">zones / ROI</text>
+
+        <rect class="b" x="684" y="60"  width="104" height="52"/>
+        <text class="t"  x="702" y="82">tiler + OSD</text>
+        <text class="ts" x="702" y="98">GPU, not VIC</text>
+
+        <rect class="b" x="816" y="24"  width="104" height="48"/>
+        <text class="t"  x="834" y="45">nv3dsink</text>
+        <text class="ts" x="834" y="61">local display</text>
+
+        <rect class="b" x="816" y="98"  width="104" height="48"/>
+        <text class="t"  x="834" y="119">NVENC</text>
+        <text class="ts" x="834" y="135">RTSP / WebRTC</text>
+
+        <rect class="bx" x="544" y="190" width="112" height="54"/>
+        <text class="t"  x="562" y="212">probe</text>
+        <text class="ts" x="562" y="228">rules → events</text>
+
+        <rect class="b" x="700" y="190" width="104" height="54"/>
+        <text class="t"  x="718" y="212">Redis</text>
+        <text class="ts" x="718" y="228">stream</text>
+
+        <rect class="b" x="848" y="190" width="120" height="54"/>
+        <text class="t"  x="866" y="212">services</text>
+        <text class="ts" x="866" y="228">event/clip/VLM</text>
+
+        <path class="ln" d="M112 86 H136"/>
+        <path class="ln" d="M244 86 C258 86 258 56 268 56"/>
+        <path class="ln" d="M244 86 C258 86 258 128 268 128"/>
+        <path class="ln" d="M384 56 C398 56 398 86 408 86"/>
+        <path class="ln" d="M384 128 C398 128 398 86 408 86"/>
+        <path class="ln" d="M516 86 H540"/>
+        <path class="ln" d="M656 86 H680"/>
+        <path class="ln" d="M788 86 C800 86 800 48 812 48"/>
+        <path class="ln" d="M788 86 C800 86 800 122 812 122"/>
+        <path class="lnd" d="M600 112 V186"/>
+        <path class="lnd" d="M656 217 H696"/>
+        <path class="lnd" d="M804 217 H844"/>
+        <text class="ts" x="606" y="152">metadata, inline</text>
+      </svg>
+    </div>
+    <div class="note">
+      The dashed path is the <b>cold path</b>: the probe publishes state <em>transitions</em>
+      fire-and-forget to Redis and never blocks the graph. Measured cost of publishing at 20
+      streams: <b>−0.9%</b> (514.2 → 509.6 fps), zero drops. The queue is bounded and drops
+      oldest-first, so an unavailable consumer cannot slow or stall the graph.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Detection models</h2>
+    <div class="wrap"><table>
+      <tr>
+        <th>Model</th><th>Task</th><th>Head</th><th>Precision</th><th>Batch</th>
+        <th>Engine</th><th>Inferences/s</th><th>Mean latency</th><th>Build</th>
+      </tr>
+      <tr>
+        <td>YOLO PPE</td><td>helmet · vest · person</td><td>pre-NMS {8, 8400}</td>
+        <td>FP16</td><td>20</td><td>7.9 MB</td><td>929.2</td><td>21.52 ms</td><td>406 s</td>
+      </tr>
+      <tr>
+        <td>YOLO PPE</td><td>same</td><td>pre-NMS {8, 8400}</td>
+        <td>INT8</td><td>20</td><td>4.0 MB</td><td>1342.1</td><td>14.90 ms</td><td>271 s</td>
+      </tr>
+      <tr>
+        <td>YOLO fire</td><td>fire · smoke</td><td>post-NMS {300, 6}</td>
+        <td>FP16</td><td>20</td><td>22.5 MB</td><td>507.8</td><td>39.38 ms</td><td>631 s</td>
+      </tr>
+    </table></div>
+    <p class="lede" style="margin-top:11px">
+      Both run at <code>infer-dims 3;640;640</code>. The parser and <code>cluster-mode</code> must
+      match the head: PPE is <b>pre-NMS</b> → <code>NvDsInferParseYoloPreNMS</code> +
+      <code>cluster-mode 2</code> (DeepStream runs NMS); fire is <b>post-NMS</b> →
+      <code>NvDsInferParseYoloPostNMS</code> + <code>cluster-mode 4</code> (no clustering).
+      Mismatch them and boxes are silently wrong rather than absent.
+    </p>
+    <div class="note">
+      <b>FP16 ships, not INT8.</b> INT8 is 1.44× faster on paper, but the pipeline is not
+      inference-bound at 20 streams — the GPU is saturated by the whole graph — so the extra
+      throughput buys nothing while costing calibration and accuracy risk.
+    </div>
+    <h3>Frame intervals</h3>
+    <div class="wrap"><table>
+      <tr><th>Branch</th><th>interval</th><th>Effective rate</th><th>Why</th></tr>
+      <tr><td>PPE</td><td>1</td><td>every frame</td><td>drives the compliance state machine</td></tr>
+      <tr><td>Fire</td><td>2</td><td>every 2nd frame</td><td>at 5 and 11 a 10 s fire is detected <b>zero</b> times</td></tr>
+    </table></div>
+    <div class="note">
+      Fire is a <b>short, sparse event</b>: a ten-second fire inside a 3-minute loop. Measured
+      against real fire footage at 20 streams — interval 2 → 28 detections at 509 fps, interval 5
+      → <b>0</b> at 500 fps, interval 11 → <b>0</b> at 510 fps. Throughput is nearly identical
+      across all three, so the interval buys almost nothing and costs the entire detection.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Tracker</h2>
+    <div class="wrap"><table>
+      <tr><th>Config</th><th>Detections</th><th>Relative speed</th><th>Status</th></tr>
+      <tr><td>NvSORT, stock</td><td><b>0</b></td><td>fastest</td><td><span class="tag warn">broken</span></td></tr>
+      <tr><td>NvSORT, tuned</td><td>matches NvDCF ±0.2%</td><td>~1.3×</td><td><span class="tag ok">shipped</span></td></tr>
+      <tr><td>NvDCF</td><td>baseline</td><td>1.0×</td><td>reference</td></tr>
+    </table></div>
+    <div class="note">
+      Stock <code>NvSORT</code> ships <code>minTrackerConfidence: 0.8216</code>. NvSORT has no
+      visual tracker, so its per-target confidence comes from Kalman + IoU association alone and
+      never reaches that threshold: <b>every target stays in shadow mode and nothing is
+      output</b>, while the pipeline reports healthy throughput because it is doing no work.
+      Shipped values:
+      <code>minTrackerConfidence 0.40</code>, <code>probationAge 2</code>,
+      <code>minIouDiff4NewTarget 0.45</code>.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>End-to-end capacity</h2>
+    <p class="lede">Full chain — decode, both detectors, tracker, analytics, tiler, OSD — on
+       realistic warehouse footage. Every row is detection-verified.</p>
+    <div class="wrap"><table>
+      <tr><th>Streams</th><th>fps</th><th>Realtime target</th><th>Headroom</th><th>GPU</th><th>RAM</th></tr>
+      <tr><td>1</td><td>254.2</td><td>30</td><td>8.47×</td><td>74%</td><td>8.0 GB</td></tr>
+      <tr><td>4</td><td>515.0</td><td>120</td><td>4.29×</td><td>94%</td><td>8.4 GB</td></tr>
+      <tr><td>8</td><td>621.3</td><td>240</td><td>2.58×</td><td>99%</td><td>8.9 GB</td></tr>
+      <tr><td>12</td><td>633.2</td><td>360</td><td>1.75×</td><td>99%</td><td>9.4 GB</td></tr>
+      <tr><td>16</td><td>625.9</td><td>480</td><td>1.30×</td><td>99%</td><td>9.8 GB</td></tr>
+      <tr><td><b>20</b></td><td><b>633.7</b></td><td><b>600</b></td><td><b>1.05×</b></td><td>99%</td><td>10.4 GB</td></tr>
+    </table></div>
+    <p class="lede" style="margin-top:10px">
+      Throughput plateaus at ~630 fps, so the practical ceiling is ~21 cameras. The same pipeline
+      reached 723.8 fps on traffic footage — <b>tracker cost scales with people, not pixels</b>,
+      and the warehouse number is the one that counts.
+    </p>
+    <h3>Tuning with a measurable cost</h3>
+    <div class="wrap"><table>
+      <tr><th>Setting</th><th>Alternative</th><th>In use</th><th>Measured difference</th></tr>
+      <tr><td>nvmultistreamtiler compute-hw</td><td>default (VIC)</td><td>GPU</td><td>−33% throughput</td></tr>
+      <tr><td>RGBA convert before OSD</td><td>present</td><td>omitted</td><td>saves a 1080p convert per batch</td></tr>
+      <tr><td>fire alert confidence floor</td><td>0.40</td><td>0.35</td><td>must not exceed the detector's own threshold</td></tr>
+      <tr><td>drop-frame-interval (with VLM)</td><td>0</td><td>2</td><td>pipeline falls <b>below realtime</b></td></tr>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <h2>Reasoning models</h2>
+    <div class="cols2">
+      <div>
+        <h3 style="margin-top:0">Cosmos Reason 2 · 2B <span class="tag">vision</span></h3>
+        <dl class="kv">
+          <dt>Role</dt><dd>reviews every incident from its clip</dd>
+          <dt>Serving</dt><dd>llama.cpp, <code>:8000</code>, BF16 GGUF</dd>
+          <dt>Weights</dt><dd>4.07 GB + 0.82 GB mmproj projector</dd>
+          <dt>Latency</dt><dd>5–10 s per incident, one at a time</dd>
+          <dt>Hot-path cost</dt><dd>3.3% at <code>dfi=2</code></dd>
+        </dl>
+        <div class="note">
+          <b>Serving requirements.</b> Cosmos Reason 2 is a Qwen3-VL architecture and needs
+          <code>--image-min-tokens 1024</code>: below that floor it stops grounding on the image
+          and answers from the prompt. The <code>mmproj</code> projector is mandatory — the model
+          loads and responds without it, but is blind.
+        </div>
+        <div class="note">
+          <b>Perception, not judgement.</b> The model is asked only what is visible — is the
+          subject a person, is a vest present, how many people, is there fire or smoke — and the
+          verdict is computed from those answers against the zone's configured limits. Asking a
+          VLM for the verdict directly yields fluent, self-contradictory reasoning; a schema
+          constrains shape but not coherence.
+        </div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Nemotron Nano 9B v2 <span class="tag">language</span></h3>
+        <dl class="kv">
+          <dt>Role</dt><dd>plans retrieval and writes the answer</dd>
+          <dt>Serving</dt><dd>llama.cpp, <code>:8001</code>, Q5_K_M</dd>
+          <dt>Weights</dt><dd>7.07 GB</dd>
+          <dt>Generation</dt><dd>28 tok/s</dd>
+          <dt>Prefill</dt><dd>580–860 tok/s</dd>
+          <dt>Answer latency</dt><dd>11.2 s idle · 23.8 s at 20 streams</dd>
+        </dl>
+        <div class="note">
+          <b><code>/no_think</code> is required.</b> Nemotron Nano v2 is a reasoning model and its
+          thinking tokens count against <code>max_tokens</code>. The OpenAI-style
+          <code>chat_template_kwargs.thinking</code> and <code>reasoning_effort</code> switches
+          are <em>silently ignored</em> by this build.
+        </div>
+        <div class="note">
+          <b>Grammar-constrained decoding.</b> Tool selection and the final answer are both
+          emitted under a JSON schema, so the model cannot name a camera or zone that does not
+          exist — the enums are built from the live database at request time. Free-text fields
+          carry explicit length bounds: an unbounded string under a grammar has no reason to
+          terminate and will generate to the token ceiling.
+        </div>
+      </div>
+    </div>
+    <div class="note">
+      <b>llama.cpp, not vLLM.</b> Both work on JetPack 7. llama.cpp costs the hot path 3.3% vs
+      vLLM's 12.9%, and 14.8 GB peak RAM vs 40.3 GB. vLLM is faster per request (TTFT 0.05 s vs
+      0.12 s idle) and remains the better choice if reasoning ever moves onto the hot path.
+      Two resident models cost <b>nothing</b> when idle — 517.8 fps at 20 streams with both
+      loaded, identical to baseline. Only inference competes.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Latency, end to end</h2>
+    <div class="wrap"><table>
+      <tr><th>Stage</th><th>p50</th><th>p90</th><th>max</th><th>What it covers</th></tr>
+      <tr><td>Detection → alert visible</td><td>0.27 s</td><td>0.56 s</td><td>0.59 s</td>
+          <td>rule fires → Redis → store → queryable</td></tr>
+      <tr><td>Evidence clip ready</td><td>2.11 s</td><td>3.36 s</td><td>3.61 s</td>
+          <td>ffmpeg stream-copy from the source</td></tr>
+      <tr><td>VLM verdict</td><td colspan="3">5–10 s each, <b>serial</b></td>
+          <td>crop + inference + decision</td></tr>
+      <tr><td>Agent answer</td><td colspan="3">11.2 s idle · 23.8 s at 20 streams</td>
+          <td>plan + retrieve + synthesise</td></tr>
+    </table></div>
+    <div class="note">
+      <b>The alert is instant; the adjudication is not.</b> An incident appears in under a second
+      marked <code>unverified</code> and its verdict lands later. Adjudication is serial by
+      design — one VLM request in flight is what keeps its hot-path cost at 3.3% — so a burst
+      queues: ~31 incidents arriving in 40 s take ~3.5 minutes to fully adjudicate. In steady
+      state incidents arrive as transitions, at a rate the adjudicator absorbs comfortably.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Services</h2>
+    <div class="wrap"><table>
+      <tr><th>Component</th><th>Port</th><th>Runtime</th><th>Responsibility</th></tr>
+      <tr><td>Vision pipeline</td><td>—</td><td>DeepStream 9.1 · Python</td>
+          <td>decode, detect, track, zone analytics, render</td></tr>
+      <tr><td>Event service</td><td>—</td><td>Python</td>
+          <td>consumes the event stream, maintains incident state</td></tr>
+      <tr><td>Clip service</td><td>—</td><td>Python · ffmpeg</td>
+          <td>cuts the evidence clip for each incident</td></tr>
+      <tr><td>Reasoning service</td><td>—</td><td>Python</td>
+          <td>VLM adjudication and hazard escalation</td></tr>
+      <tr><td>Notification service</td><td>—</td><td>Python</td>
+          <td>pushes alerts with video to Telegram</td></tr>
+      <tr><td>Control plane</td><td>8080</td><td>FastAPI</td>
+          <td>REST, WebSocket, dashboard, clip streaming</td></tr>
+      <tr><td>Vision model server</td><td>8000</td><td>llama.cpp</td>
+          <td>Cosmos Reason 2 · 2B</td></tr>
+      <tr><td>Language model server</td><td>8001</td><td>llama.cpp</td>
+          <td>Nemotron Nano 9B v2</td></tr>
+      <tr><td>Media server</td><td>8554 · 8889 · 8888</td><td>mediamtx</td>
+          <td>RTSP · WebRTC · HLS of the tiled wall</td></tr>
+      <tr><td>Event bus</td><td>6379</td><td>Redis</td>
+          <td>pipeline → services, fire-and-forget</td></tr>
+      <tr><td>Incident store</td><td>—</td><td>SQLite (WAL)</td>
+          <td>incidents, verdicts, clip and delivery state</td></tr>
+    </table></div>
+    <div class="note">
+      Services <b>poll the store</b> rather than being called by the pipeline. Each is
+      independently restartable and naturally rate-limited, and a failure in any of them — a
+      stalled model server, an unreachable network — cannot touch incident capture. The store is
+      WAL and opened read-only for queries, so the dashboard reads while 20 cameras write.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Data flow</h2>
+    <p class="lede">
+      <code>detector → rules (debounce) → state TRANSITION → Redis → incident store → clip →
+      VLM verdict → dashboard / Telegram / agent</code>
+    </p>
+    <div class="note">
+      <b>An event is a state transition, not a frame observation.</b> The rules layer publishes
+      only when a debounced verdict flips — 2225 frame-level observations across 6 cameras in
+      120 s resolve to <b>6 incidents</b>. Incidents are reference-counted: one incident folds
+      many tracks and closes only when the last of them clears, so track-id churn does not
+      fragment a single situation into dozens of rows.
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  Industry Safety Operations Monitoring System · Jetson AGX Orin 64 GB ·
+  all figures measured on this device
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,7 @@
+variant,measured_fps,gr3d_pct_peak,note
+full,41.1,99,
+no-probe,41.3,99,--no-probe
+no-tracker,60.2,99,--no-tracker
+no-tracker-no-probe,60.3,99,--no-tracker --no-probe
+no-fire,46.8,76,--no-fire
+no-fire-no-tracker,71.0,66,--no-fire --no-tracker

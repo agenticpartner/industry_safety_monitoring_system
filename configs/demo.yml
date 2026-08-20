@@ -1,0 +1,158 @@
+# Single source of truth for a demo run. Everything that changes between the N=1 correctness
+# check, the 1->20 benchmark sweep, and the client-facing RTSP demo lives here — app code never
+# needs editing to scale or to move a model between GPU and DLA.
+
+pipeline:
+  streams: 1                 # 1..20. The sweep overrides this per step.
+  source_mode: file          # file | rtsp
+
+  # serial   — mux -> nvinfer(ppe) -> nvinfer(fire) -> tracker -> ...   (default)
+  # parallel — mux -> tee -> {nvinfer(ppe), nvinfer(fire)} -> nvdsmetamux -> tracker -> ...
+  #
+  # Parallel only pays off when one model is DLA-resident, so GPU and DLA can work the same
+  # batch concurrently. With both models on GPU it adds an nvdsmetamux synchronisation point
+  # for no throughput gain, so serial is the default until bench/dla_qualification.md says
+  # otherwise.
+  topology: serial
+
+  # Decoder emits every Nth frame. 0/1 = every frame (30fps analytics, the Phase 1 behaviour);
+  # 3 = 10fps analytics, the Phase 2 design point.
+  #
+  # This is what buys the GPU headroom that local reasoning needs. INGEST stays 30fps and
+  # smart-record evidence clips stay 30fps (they capture the encoded stream ahead of the
+  # decoder) — only the analytics path slows. The live tiled view slows with it, which is an
+  # accepted trade for a monitoring wall.
+  #
+  # Measured at 20 streams (bench/vlm_feasibility.md): the difference between the pipeline
+  # surviving a sustained reasoning burst and dropping below realtime.
+  #
+  #   dfi=0  941 -> 522 fps under reasoning (-44.6%) vs 600 target = 0.87x  FAILS realtime
+  #   dfi=2  524 -> 506 fps under reasoning ( -3.3%) vs 300 target = 1.69x  <- chosen
+  #   dfi=3  340 -> 327 fps under reasoning ( -3.8%) vs 200 target = 1.64x
+  #
+  # 2 rather than 3: the margin is the same either way, so there is no throughput reason to take
+  # the slower analytics rate — and at 15 fps objects move half as far between frames as at 10,
+  # which is easier on NvSORT's IoU association and therefore on track-ID stability, which the
+  # compliance debouncing depends on. (Track stability at 15 fps is still TO BE VERIFIED.)
+  #
+  # Set back to 0 to reproduce the Phase 1 benchmark numbers.
+  drop_frame_interval: 2
+  muxer:
+    width: 1920
+    height: 1080
+    batched_push_timeout_us: 40000   # ~1.2 frame times at 30fps
+  tiler:
+    width: 1920
+    height: 1080
+    # rows/cols are derived from `streams` (ceil(sqrt)) unless pinned here.
+    rows: null
+    cols: null
+
+sources:
+  # file mode: nvurisrcbin over file:// with looping, so short clips run indefinitely.
+  # This is the mode to BENCHMARK in — no network, no external host, repeatable numbers.
+  file_glob: media/cam*.mp4
+  loop: true
+
+  # rtsp mode: cameras are served from ANOTHER machine (scripts/serve_rtsp_sources.sh), not from
+  # the Jetson. Production cameras are separate network devices; generating the streams on the
+  # same box that runs inference would burn CPU alongside it and misrepresent the load. The
+  # Jetson should only ever pull and decode.
+  #
+  # Point this at the LAN IP of the machine running serve_rtsp_sources.sh (that script prints
+  # the exact line to paste here when it starts), or at your real camera server.
+  rtsp_base: rtsp://CHANGE-ME-SOURCE-HOST:8554
+  rtsp_pattern: cam%02d
+
+inference:
+  ppe:
+    config: configs/pgie_ppe.yml
+    enabled: true
+  fire:
+    config: configs/pgie_fire.yml
+    enabled: true
+
+tracker:
+  # NvSORT (Kalman + IoU association, no visual features), referenced in place rather than
+  # forked so NVIDIA's tuning doesn't drift.
+  #
+  # Measured at 20 streams: NvDCF_perf 466 fps, NvSORT 560 fps, IOU 851 fps against a 600 fps
+  # target. NvDCF's per-object visual correlation is the single most expensive element in the
+  # pipeline and buys re-identification quality we do not need for compliance debouncing, which
+  # only requires a stable ID across a ~0.5 s window. IOU is faster still but drops the motion
+  # model, so IDs swap under occlusion — bad for a violation counter.
+  #
+  # NOTE for Phase 5: cross-camera tracking WILL need re-ID embeddings, so that phase should
+  # re-evaluate NvDCF or NvDeepSORT and re-measure the budget.
+  #
+  # WARNING: do NOT point this at the stock config_tracker_NvSORT.yml. Its
+  # minTrackerConfidence=0.8216 is unreachable without a visual tracker, so every target stays in
+  # shadow mode and the pipeline emits ZERO objects while appearing fast. configs/
+  # tracker_nvsort_tuned.yml is the retuned fork; see the header in that file.
+  config: configs/tracker_nvsort_tuned.yml
+  # Tracking is not decoration here: violation debouncing needs stable per-person IDs, and the
+  # later multi-camera phase builds on the same tracker.
+  enabled: true
+
+sinks:
+  display:
+    enabled: true
+    # Leave null to auto-detect the live X display (scripts/env.sh probes /tmp/.X11-unix).
+    # Pin it to ":0" / ":1" only if detection picks the wrong one — on a Jetson running a
+    # desktop session the server is often on :1, and nv3dsink fails with an unhelpful
+    # "no display found" against the wrong number.
+    display: null
+  rtsp_out:
+    enabled: false           # turn on for the remote/client demo
+    port: 8554
+    mount: /safety
+    bitrate_kbps: 4000
+    # Pace the sink to the media clock. Without this the pipeline runs flat out (~1.7x realtime
+    # at 20 streams on file sources) and the published stream plays back sped up. Set false only
+    # when benchmarking the encode path.
+    realtime: true
+
+rules:
+  # Frames of history per tracked person, and the fraction of them that must agree before the
+  # compliance state flips. Stops the per-frame flicker that makes a demo look broken.
+  window_frames: 15
+  flip_ratio: 0.6
+
+  helmet:
+    enabled: true
+    # Direct signal: the model has an explicit `no-helmet` class.
+    min_confidence: 0.35
+
+  vest:
+    enabled: true
+    # INFERRED signal — there is no `no-vest` class, so this is "a human with no overlapping
+    # vest box". Held to a higher bar because absence of evidence is weaker evidence than the
+    # helmet case, and occlusion produces false violations.
+    min_confidence: 0.45
+    # Fraction of the vest box that must fall inside the person box to count as "theirs".
+    containment: 0.5
+    # Only judge people big enough to see a vest on. Distant tiny boxes are skipped entirely
+    # rather than reported as violations.
+    min_person_height_px: 80
+
+  fire:
+    enabled: true
+    # MUST NOT be stricter than the detector's own `pre-cluster-threshold` in configs/pgie_fire.yml
+    # (0.35). When it was 0.40 the pipeline reported `fire=23` detections in --stats while raising
+    # ZERO fire alerts: every detection landed in the 0.35-0.40 band, counted by the stats probe
+    # and then dropped by this rule. Two thresholds for one decision, and the gap between them was
+    # invisible — the run looked like a working fire detector with a broken event path.
+    min_confidence: 0.35
+    # Hold the alert on screen after the last detection so a flickering flame stays visible.
+    latch_seconds: 2.0
+    # `other` is a training-set catch-all, not a safety signal.
+    ignore_classes: [other]
+
+render:
+  # 'gpu' | 'vic' | 'default'. Jetson's default for nvvideoconvert and nvmultistreamtiler is VIC,
+  # a fixed-function block that is much slower than the GPU for 1080p scale/convert and which
+  # serialises. Measured as the dominant pipeline cost — see bench/findings.md.
+  compute_hw: gpu
+  # nvdsosd GPU mode accepts NV12, so the NV12->RGBA convert is not required. Leave false unless
+  # something downstream genuinely needs RGBA.
+  osd_rgba: false

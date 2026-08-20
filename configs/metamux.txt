@@ -1,0 +1,23 @@
+# nvdsmetamux — merges the PPE branch and the fire branch back into one batch_meta.
+#
+# Only used when demo.yml sets topology: parallel. In serial topology the two nvinfer elements
+# are chained and no muxing is needed.
+#
+# sink_0 is the PPE branch and is the active pad: its buffer is what continues downstream, so
+# the video that reaches the tiler/OSD is the PPE branch's. The fire branch contributes metadata
+# only. That choice matters because the PPE branch runs at interval=1 while fire runs at
+# interval=5 — taking video from the slower branch would throttle the whole pipeline.
+#
+# src-ids-model-* are deliberately left unset: every source should be muxed from both models.
+
+[property]
+enable=1
+active-pad=sink_0
+# 60 ms. Both branches see the same frames from the same muxer, so PTS should match closely;
+# this tolerance only needs to absorb the two branches' differing processing latency.
+pts-tolerance=60000
+
+[user-configs]
+
+[group-0]
+# gie-unique-id 1 = ppe, 2 = fire (see configs/pgie_*.yml). Unset means "mux all sources".

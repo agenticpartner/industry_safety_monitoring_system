@@ -1,0 +1,5 @@
+# build/venv-hf — model weight downloads only.
+#
+# Isolated from the export venv so a huggingface_hub upgrade can never disturb a working
+# torch/ultralytics/onnx combination that produced engines already in use.
+huggingface_hub>=0.25

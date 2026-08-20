@@ -1,0 +1,110 @@
+# Phase 2 service topology. Separate from demo.yml on purpose: demo.yml describes the PIPELINE
+# (what to detect, how fast, where to render), this describes the SERVICES around it (bus, store,
+# reasoning endpoint, retention). They have different lifecycles — the pipeline gets restarted
+# constantly during tuning; the services are meant to stay up.
+
+events:
+  enabled: false             # --events turns it on; left off so benchmarks match Phase 1
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    stream: safety:events
+    # Bound the stream so a long soak cannot fill the NVMe. At ~300 bytes/event this is ~30 MB.
+    # `~` (approximate) trimming is used, so the real length hovers slightly above this.
+    maxlen: 100000
+  # In-memory queue between the probe and the publisher thread. Sized for a burst of
+  # simultaneous violations across 20 cameras, not for sustained backlog: if it fills, the
+  # oldest events are dropped and counted rather than the pipeline being stalled.
+  queue_size: 2048
+
+store:
+  # SQLite, on the NVMe. WAL mode so the API can read while the event service writes.
+  path: data/events.db
+  # Merge repeated violations of the same type on the same camera within this window into one
+  # incident with a hit count, instead of one row each.
+  #
+  # This exists because ~26% of tracks at 15fps analytics are too short to be adjudicated, so a
+  # single person can churn through several track ids and produce several "new violation" events.
+  # Deduping on track_id alone would not catch that. 30s is a deliberate trade: it suppresses
+  # genuine separate violations by DIFFERENT people on the same camera within the window, which
+  # is the price of not spamming the operator. Revisit once zones (2.2) give a better key.
+  merge_window_s: 30
+  retention_days: 30
+
+  # Re-raise an incident that is STILL OPEN after this long, and again every interval after.
+  # A continuously-violating situation merges rather than reopening — correct, because one person
+  # violating for an hour is one incident, not thousands of alerts — but the consequence is
+  # silence: on a 20-camera run, 19 PPE incidents sat open for 82 minutes having absorbed ~53,000
+  # detections, with nothing raised after the first minute. Silence is the wrong answer to "still
+  # unresolved". Set 0 to disable.
+  realert_after_s: 480
+
+clips:
+  dir: data/clips
+  # Window cut around the incident. Pre-roll matters more than post: an operator wants to see what
+  # led up to the violation, and the incident itself persists for as long as the person does.
+  pre_roll_s: 6
+  post_roll_s: 6
+  # Hard disk budget. Oldest clips are deleted first and the incident row is marked `expired`
+  # rather than removed — the incident still happened, only the evidence aged out.
+  # 4 GB is ~600 clips at 12s of 4 Mbit/s H.265.
+  budget_mb: 4000
+
+reasoning:
+  # Phase 2.0 chose llama.cpp; see bench/vlm_feasibility.md.
+  endpoint: http://127.0.0.1:8000/v1
+  model: Cosmos-Reason2-2B
+  enabled: true
+  # Consecutive failures that open the circuit, and how long it stays open. While open the
+  # service sleeps rather than hammering a sick endpoint — incidents simply stay `unverified`
+  # and the product keeps working, less richly.
+  breaker_threshold: 5
+  breaker_cooldown_s: 60
+  # One request in flight is not configurable on purpose: llama-server runs --parallel 1, and the
+  # 3.3% hot-path cost measured in Phase 2.0 depends on never queueing more than that.
+
+# ---------------------------------------------------------------------------------------------
+# Outbound notifications (Phase 2.9) — Telegram
+# ---------------------------------------------------------------------------------------------
+notify:
+  telegram:
+    # OFF by default. This is the only component that sends anything OFF the device, and an alert
+    # pushed to someone's phone cannot be unsent. Turning it on is a deliberate act.
+    enabled: false
+    # Credentials are NEVER stored here. `.env` at the repo root holds them (same place as
+    # HF_TOKEN), sourced explicitly because Ubuntu's .bashrc returns early for non-interactive
+    # shells so exports there are invisible to `ssh host 'cmd'`:
+    #     TELEGRAM_BOT_TOKEN=...
+    #     TELEGRAM_CHAT_ID=...
+    # This file is committed to git; a token in it would be a token in the repo history forever.
+    token_env: TELEGRAM_BOT_TOKEN
+    chat_env: TELEGRAM_CHAT_ID
+
+  # WHAT is worth interrupting someone for. A phone notification has a far higher cost than a row
+  # in a feed: 20 cameras produce dozens of PPE incidents a minute, and a channel that buzzes that
+  # often gets muted, at which point it protects nobody. So the default is "things that are either
+  # dangerous or adjudicated", not "everything".
+  #
+  #   always      — sent regardless of verdict. Fire and VLM-raised hazards: waiting for
+  #                 adjudication on a fire is indefensible.
+  #   confirmed   — sent only once the VLM has CONFIRMED them, so a traffic cone mistaken for a
+  #                 worker never reaches anyone's phone. Costs the VLM queue latency (~6 s each,
+  #                 serial), which is the right trade for a non-emergency.
+  always_types: [fire_alert, hazard_alert]
+  confirmed_types: [ppe_violation, overcrowding]
+  min_severity: high            # critical | high | medium
+
+  # Wait this long for the evidence clip before sending text-only. The clip is the point — an
+  # operator who cannot see it has to walk to a screen — but a fire alert must not be delayed
+  # indefinitely by a clip that failed to cut.
+  clip_wait_s: 20
+
+  # Rate limiting. Both are needed: the per-camera cooldown stops one persistent situation
+  # dominating the channel, and the global cap stops a burst across many cameras from doing it.
+  # A cold start at 20 streams produces ~30 incidents in 40 s (bench/alert_latency.md).
+  cooldown_per_camera_s: 120
+  max_per_minute: 6
+  # Fire ignores the cooldown. If it is burning on two cameras, both messages matter.
+  cooldown_exempt_types: [fire_alert]
+
+  poll_interval_s: 2.0

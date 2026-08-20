@@ -1,0 +1,67 @@
+# PGIE-2 — fire / smoke detector
+#
+# Model : YOLO26s, 3 classes  [0] fire  [1] other  [2] smoke
+# Head  : output0 [batch, 300, 6] = (x1, y1, x2, y2, conf, cls), row-major, POST-NMS
+#         -> cluster-mode 4 (no clustering) + NvDsInferParseYoloPostNMS
+#
+# Runs as a parallel branch alongside the PPE detector, merged by nvdsmetamux. It is NOT chained
+# after it: the two models are independent full-frame detectors, and branching is what lets one
+# run on DLA while the other runs on GPU instead of the two queueing behind each other.
+#
+# The `other` class is a training-set catch-all, not a safety signal — app/rules.py ignores it.
+
+property:
+  gpu-id: 0
+  gie-unique-id: 2
+  process-mode: 1          # primary: operates on full frames
+  network-type: 0          # detector
+
+  onnx-file: ../models/fire/model/fire.onnx
+  model-engine-file: ../models/fire/model/fire_gpu_b20_fp16.engine
+  labelfile-path: ../models/fire/config/labels.txt
+
+  batch-size: 20
+  network-mode: 2          # FP16
+
+  # REQUIRED: dynamic ONNX axes (see pgie_ppe.yml).
+  infer-dims: 3;640;640
+
+  net-scale-factor: 0.0039215697
+  model-color-format: 0    # RGB
+  maintain-aspect-ratio: 1
+  symmetric-padding: 1
+
+  num-detected-classes: 3
+  cluster-mode: 4          # none — the head already ran NMS
+  parse-bbox-func-name: NvDsInferParseYoloPostNMS
+  custom-lib-path: ../models/parser/libnvds_yolo_parser.so
+
+  # Fire and smoke evolve over seconds, not frames, so this is the cheapest headroom in the
+  # pipeline. Inferring every 12th frame gives 400 ms detection latency — immaterial for a fire
+  # alarm — and cuts this branch to ~50 inferences/s at 20 streams.
+  #
+  # Measured at 20 streams with NvSORT: interval 5 -> 560 fps, interval 11 -> 700 fps against a
+  # 600 fps target. This one line is the difference between missing and meeting 20 cameras.
+  # MEASURED with real fire footage spliced into cam07 (scripts/splice_fire.sh), 20 streams:
+  #
+  #   interval  fire detections  fps
+  #   0         570              312.0   (only 1.04x over the 300 target — too tight)
+  #   2          28              509.3   <- chosen
+  #   5           0              500.1
+  #   11          0              510.1   (previously shipped)
+  #
+  # At 5 and 11 the fire detector finds NOTHING: a ten-second fire passes through undetected.
+  # The earlier tuning that raised this 5 -> 11 for +20% throughput was measured on warehouse
+  # footage containing no fire, so the recall cost was invisible — you cannot observe what
+  # skipping frames costs when there is nothing to detect. 2 costs ~nothing against 11 (509 vs
+  # 510 fps) and actually detects.
+  interval: 2
+
+  # First DLA offload candidate: least latency-sensitive model in the pipeline.
+  # Enable ONLY if bench/dla_qualification.md records a PASS — partial placement is never shipped.
+  # enable-dla: 1
+  # use-dla-core: 0
+
+class-attrs-all:
+  pre-cluster-threshold: 0.35
+  topk: 50

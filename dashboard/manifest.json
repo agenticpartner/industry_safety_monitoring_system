@@ -1,0 +1,13 @@
+{
+  "name": "Safety Operations",
+  "short_name": "Safety Ops",
+  "description": "Industrial safety monitoring — incidents, clips, live view and agent",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0c0e",
+  "theme_color": "#0b0c0e",
+  "orientation": "any",
+  "icons": [
+    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

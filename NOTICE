@@ -1,0 +1,59 @@
+Industry Safety Monitoring System
+Copyright (c) 2026 Rajat M R
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. See LICENSE for the full text.
+
+
+THIRD-PARTY CONTENT
+===================
+
+Not everything in this repository is covered by the licence above.
+
+
+1. NVIDIA agent skills — `.claude/skills/`
+-------------------------------------------
+28 skills authored and owned by NVIDIA Corporation, redistributed unmodified so that an AI coding
+assistant working in this repository has the DeepStream, Jetson and VSS reference material to hand.
+
+Each skill carries its own terms in its `skill-card.md`. Across the set these are Apache-2.0,
+CC-BY-4.0 AND Apache-2.0, and Apache-2.0 OR MIT; every one is marked by NVIDIA as ready for
+commercial and non-commercial use. They are NOT licensed under the AGPL, and NVIDIA remains their
+copyright holder.
+
+Check the specific skill's `skill-card.md` before reusing one outside this repository.
+
+
+2. Detection models — downloaded, not committed
+------------------------------------------------
+`scripts/export_models.py` downloads two third-party checkpoints at setup time. Neither is
+included in this repository and neither is covered by its licence.
+
+  PPE / helmet / vest    melihuzunoglu/ppe-detection            YOLOv11  — AGPL-3.0
+  Fire / smoke           SalahALHaismawi/yolov26-fire-detection YOLOv26  — MIT
+
+The PPE detector is a YOLOv11 model and the export path uses Ultralytics, both AGPL-3.0. This is
+why this repository is AGPL-3.0 as well. If you replace the detectors with models under different
+terms, the obligations that follow from those models are yours to determine.
+
+
+3. Tracker configuration — `configs/tracker_nvsort_tuned.yml`
+--------------------------------------------------------------
+A modified copy of NVIDIA's NvSORT tracker configuration, retaining its original
+SPDX-License-Identifier: Apache-2.0 header. Copyright (c) NVIDIA CORPORATION & AFFILIATES.
+
+Three values differ from the stock config (minTrackerConfidence, probationAge,
+minIouDiff4NewTarget); the reason is documented in project_skill.md §6, trap 14.
+
+
+4. Runtime dependencies — not redistributed here
+-------------------------------------------------
+NVIDIA DeepStream SDK, TensorRT, CUDA and JetPack are installed separately and are subject to
+NVIDIA's own licence agreements. mediamtx (MIT) and llama.cpp (MIT) are downloaded at setup time.
+Python dependencies are listed in `requirements/` and retain their own licences.
+
+
+5. Benchmark media
+-------------------
+No video is committed to this repository. `media/` ships empty; you supply your own footage.

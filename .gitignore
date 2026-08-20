@@ -1,0 +1,66 @@
+# Everything ignored here is REPRODUCIBLE from what IS committed:
+#
+#   .env              <- .env.example (your own tokens, never anyone else's)
+#   media/            <- scripts/make_streams.sh
+#   *.onnx *.pt       <- scripts/export_models.py (downloads from HuggingFace)
+#   *.engine          <- scripts/build_engines.sh. TensorRT engines are specific to the exact
+#                        GPU, driver and TensorRT version that built them, so committing one
+#                        would be actively wrong on anybody else's machine.
+#   *.so              <- make -C models/parser
+#   build/            <- scripts/setup.sh (venvs, mediamtx, llama.cpp build)
+#   data/ logs/       <- runtime state: the incident database, evidence clips, service logs
+#
+# What IS committed: all source, all configs, the class-label files (they are the class-index
+# contract that the parser and the nvinfer configs both depend on), the benchmark results, and
+# the NVIDIA agent skills under .claude/skills/.
+
+# --- credentials ---
+# The single most important line in this file.
+.env
+*.env.local
+
+# --- generated media (hundreds of MB) ---
+# `media/*` not `media/`: excluding the directory itself makes the negation below unreachable,
+# because git never descends into an excluded directory.
+media/*
+!media/.gitkeep
+
+# --- model artifacts ---
+*.onnx
+*.pt
+*.engine
+*.so
+*.gguf
+*.safetensors
+*.timing.cache
+*.cache
+models/export_summary.json
+models/cosmos/
+models/nemotron/
+
+# --- build products and runtime state ---
+build/
+data/
+logs/*
+!logs/.gitkeep
+
+# --- benchmark run detritus (per-step logs, tegrastats dumps) ---
+# The CSVs, the findings and the demo screenshot ARE kept — they are the evidence behind every
+# number quoted in the dashboard and in project_skill.md.
+bench/sweep_*/
+bench/engines/
+bench/dla/
+bench/*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# --- editor / OS ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

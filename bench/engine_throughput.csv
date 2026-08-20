@@ -1,0 +1,4 @@
+model,precision,batch,qps_batches_per_s,inferences_per_s,mean_latency_ms,build_s
+ppe,fp16,20,46.4607,929.2140,21.5222,406
+ppe,int8,20,67.1042,1342.0840,14.9007,271
+fire,fp16,20,25.3907,507.8,39.3832,631

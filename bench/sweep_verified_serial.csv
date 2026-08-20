@@ -1,0 +1,9 @@
+stream_count,elapsed_s,measured_fps,target_fps,per_stream_fps,holds_realtime,headroom_x,gr3d_pct_peak,nvdec_mhz_peak,dla0,dla1,ram_mb_peak,emc_pct_peak,detections
+1,5.341842935,270.1,30,270.1,YES,9.00,74,83,off,off,7521,18,helmet=374;human=2248;no-helmet=38;vest=158
+2,6.761289042,426.8,60,213.4,YES,7.11,86,85,off,off,7648,31,helmet=748;human=4496;no-helmet=76;vest=316
+4,10.435389703,553.1,120,138.2,YES,4.60,96,92,off,off,7921,44,helmet=1496;human=8992;no-helmet=152;vest=632
+8,17.443748583,661.7,240,82.7,YES,2.75,99,99,off,off,8438,55,helmet=2992;human=17984;no-helmet=304;vest=1264
+12,24.982849470,693.1,360,57.7,YES,1.92,99,99,off,off,8899,59,helmet=4488;human=26976;no-helmet=456;vest=1896
+16,32.601405393,708.1,480,44.2,YES,1.47,99,99,off,off,9410,61,helmet=5984;human=35960;no-helmet=608;vest=2528
+18,36.263525569,716.2,540,39.7,YES,1.32,99,99,off,off,9700,62,helmet=6872;human=40259;no-helmet=698;other=7;vest=2900
+20,39.872316811,723.8,600,36.1,YES,1.20,99,99,off,off,9999,63,helmet=7620;human=44771;no-helmet=774;other=7;vest=3216

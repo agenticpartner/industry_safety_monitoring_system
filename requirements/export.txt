@@ -1,0 +1,9 @@
+# build/venv-export — detector weights -> ONNX.
+#
+# torch is installed separately by scripts/setup.sh from the CPU wheel index. That is deliberate:
+# this venv only ever traces a model to ONNX, TensorRT does every actual inference, so a CUDA
+# torch build would be a multi-gigabyte download for no benefit.
+ultralytics>=8.3
+onnx>=1.16
+onnxslim
+onnxruntime
