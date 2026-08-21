@@ -85,6 +85,17 @@ print(line)
 ' || echo "    (could not read /live/status)"
 
 echo
-echo "==> dashboard: http://$(hostname):8080/"
+# Print the ADDRESSES the dashboard answers on, not this machine's hostname. A hostname only
+# works if the viewer's DNS agrees, and it may quietly resolve to something else entirely —
+# a stale VPN entry for the same name sent a browser to a dead host and looked like the
+# dashboard being down.
+echo "==> dashboard:"
+for _ip in $(hostname -I 2>/dev/null); do
+  case "$_ip" in
+    127.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|*:*) continue ;;   # loopback, docker, IPv6
+  esac
+  echo "      http://${_ip}:8080/"
+done
+echo "      http://$(hostname):8080/   (only if this name resolves from the viewer)"
 echo "    A clip takes 2-3 s to cut and the VLM adjudicates at ~6 s each, serially —"
 echo "    a cold start burst takes a few minutes to fully verify. Alerts appear in <1 s."

@@ -367,14 +367,15 @@ the trustworthy signal.
 | `Failed to initilaize low level lib` | The tracker `dlopen`s libmosquitto | `sudo apt install libmosquitto1` |
 | `setDimensions: Error Code 3` | Dynamic-axis ONNX without explicit dims | `infer-dims=3;640;640` in the nvinfer config |
 | `nv3dsink: no display found` | Wrong X display number | Auto-detected by `scripts/env.sh`; pin with `DISPLAY_NUM` in `.env` |
+| `Could not get EGL display connection`, then `nvinfer ... Failed to set buffer pool to active` | `DISPLAY` points at an X server this user cannot reach — often the login-screen greeter. The error names nvinfer but the model is fine | Leave `DISPLAY` **unset** and run headless; `scripts/env.sh` now probes with `xdpyinfo` and only exports a display that answers |
 | Pipeline deadlocks in PAUSED, no error | A sink missing `async=0` with a `tee` in the graph | Set `async=0` on every sink |
 | Black video box in the dashboard | Three different causes | `curl localhost:8080/live/status` — it names which one and the next action |
 | Evidence clip plays as a black rectangle | Browsers cannot decode H.265 | Already handled — `/clips/{id}` transcodes lazily. Check `logs/api.log` |
 | Agent answers slowly, always with the same plan | The soft fallback is firing | Check `plan_error` in the response |
-| `database is locked` | A write from a read path, or an uncommitted empty transaction | See `project_skill.md` §6, traps 22 and 26 |
+| `database is locked` | A write from a read path, or an uncommitted empty transaction | See `project_skill.md` §6, traps 23 and 27 |
 | Throughput varies wildly between runs | Clocks not locked, or a previous pipeline still alive | `sudo jetson_clocks`; `ps -eo args \| grep '[s]afety_pipeline'` |
 
-The full trap list — 66 verified behaviours, several of which contradict the SDK docs — is in
+The full trap list — 67 verified behaviours, several of which contradict the SDK docs — is in
 [`project_skill.md`](project_skill.md) §6.
 
 ---

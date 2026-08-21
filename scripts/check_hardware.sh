@@ -218,14 +218,23 @@ fi
 # ---------------------------------------------------------------------------------------------
 head_ "Display"
 # ---------------------------------------------------------------------------------------------
-# There is no safe default: a Jetson running a desktop session commonly puts X on :1, and
-# nv3dsink against the wrong number fails with "no display found".
+# A socket proves an X server exists, NOT that this user may connect to it: at the login screen
+# :0 belongs to the display manager's greeter, root-owned and with no xauth cookie for the
+# service user. That distinction is not cosmetic — a set-but-unreachable DISPLAY makes
+# nvbufsurftransform fail EGL init and the pipeline never reaches PLAYING, reporting the error
+# against nvinfer. So probe with xdpyinfo and report the two cases differently.
+_sock_seen=""
 for sock in /tmp/.X11-unix/X*; do
   [ -e "$sock" ] || continue
-  DETECTED_DISPLAY=":${sock##*/X}"; break
+  _sock_seen=":${sock##*/X}"
+  if DISPLAY="$_sock_seen" xdpyinfo >/dev/null 2>&1; then
+    DETECTED_DISPLAY="$_sock_seen"; break
+  fi
 done
 if [ -n "$DETECTED_DISPLAY" ]; then
-  ok "X display" "$DETECTED_DISPLAY (auto-detected)"
+  ok "X display" "$DETECTED_DISPLAY (reachable — local preview available)"
+elif [ -n "$_sock_seen" ]; then
+  warn "X display" "$_sock_seen exists but is NOT reachable by this user (greeter/xauth) — running headless, which is correct; do NOT force DISPLAY_NUM at it"
 else
   warn "X display" "none found — headless is fine; the dashboard and RTSP output do not need one"
 fi

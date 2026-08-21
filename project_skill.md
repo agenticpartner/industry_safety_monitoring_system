@@ -261,13 +261,32 @@ These were each hit and diagnosed on a running device. Several contradict the SD
     the parser's own log line:
     - ppe `{8, 8400}` → pre-NMS (v11) → `NvDsInferParseYoloPreNMS`, `cluster-mode=2`
     - fire `{300, 6}` → post-NMS (v26) → `NvDsInferParseYoloPostNMS`, `cluster-mode=4`
-13. **`pipeline.wait()` cannot be interrupted.** It blocks in C++, so SIGINT/SIGTERM are ignored
+13. **A set-but-unreachable `DISPLAY` is worse than no `DISPLAY` at all.** `nvbufsurftransform`
+    opens an EGL display against whatever `DISPLAY` says; when that server exists but cannot be
+    connected to, EGL init fails and the pipeline never reaches PLAYING:
+
+    ```
+    nvbufsurftransform: Could not get EGL display connection
+    nvinfer <pgie_fire> error: Failed to set buffer pool to active
+    Unable to set the pipeline to the playing state.
+    ```
+
+    The error names **nvinfer**, so it reads as a model or engine fault. It is not: with
+    `DISPLAY` unset, DeepStream takes the headless path and the identical configuration runs.
+    Observed on a device sitting at the GDM login screen — `/tmp/.X11-unix/X0` existed, so a
+    socket-existence check happily selected `:0`, but the socket was root-owned by the greeter
+    with no xauth cookie for the service user. **A socket proves a server exists, not that you
+    may talk to it — probe with `xdpyinfo`.** `scripts/env.sh` and `_detect_display()` in
+    `app/safety_pipeline.py` both do, and leave `DISPLAY` unset when nothing answers;
+    `want_display` then drops the display sink rather than taking the pipeline down with it.
+
+14. **`pipeline.wait()` cannot be interrupted.** It blocks in C++, so SIGINT/SIGTERM are ignored
     and even a timer-thread `pipeline.stop()` does not unblock it. Use `--duration` to bound a run
     and `timeout --signal=KILL` as the exit path.
 
 ### The tracker trap
 
-14. **The stock `config_tracker_NvSORT.yml` emits ZERO objects.** It sets
+15. **The stock `config_tracker_NvSORT.yml` emits ZERO objects.** It sets
     `minTrackerConfidence: 0.8216`; NvSORT has no visual tracker, so its per-target confidence
     comes from Kalman + IoU association alone and never reaches that. Every target stays in shadow
     mode and nothing is output — while the pipeline looks healthy and runs *faster* than a working
@@ -282,100 +301,100 @@ These were each hit and diagnosed on a running device. Several contradict the SD
 
 ### Zone analytics
 
-15. **`pyservicemaker` reads nvdsanalytics metadata fine** — no `pyds` gap here.
+16. **`pyservicemaker` reads nvdsanalytics metadata fine** — no `pyds` gap here.
     `obj.nvdsanalytics_obj_items` → `as_nvdsanalytics_obj()` → `roi_status`, `lc_status`,
     `oc_status`; `frame_meta.nvdsanalytics_frame_items` → `as_nvdsanalytics_frame()`. Read them
     inline like everything else.
-16. **Object `oc_status` is a LIST, frame `oc_status` is a DICT `{zone: bool}`.** Iterating the
+17. **Object `oc_status` is a LIST, frame `oc_status` is a DICT `{zone: bool}`.** Iterating the
     dict yields keys, so treating it like the list marks every configured zone as overcrowded.
-17. **nvdsanalytics takes ONE config with per-stream sections** (`[roi-filtering-stream-0]`), not
+18. **nvdsanalytics takes ONE config with per-stream sections** (`[roi-filtering-stream-0]`), not
     one file per camera. The section suffix is the 0-based source index.
-18. **Only one `[overcrowding-stream-N]` section per stream** — INI keys must be unique, so
+19. **Only one `[overcrowding-stream-N]` section per stream** — INI keys must be unique, so
     several zones share one section and therefore one `object-threshold`. The generator warns
     rather than silently dropping.
 
 ### The incident store
 
-19. **`merge_window_s` is a linger period, not a length cap.** It absorbs track-id churn (~26% of
+20. **`merge_window_s` is a linger period, not a length cap.** It absorbs track-id churn (~26% of
     tracks are too short to adjudicate), so it merges into open incidents *always* and reopens
     ones closed within the window. Bounding by incident start time instead let a 37 s incident
     spawn a second open incident alongside itself.
-20. **A merged incident goes silent, so long-open ones are RE-RAISED** (`store.raise_stale`,
+21. **A merged incident goes silent, so long-open ones are RE-RAISED** (`store.raise_stale`,
     `realert_after_s: 480`). Continuous violation merges rather than reopening — correct, one
     person violating for an hour is one incident — but on a 20-camera run 19 PPE incidents sat
     open for 82 minutes having absorbed ~53,000 detections with nothing raised after the first
     minute. Every fresh alert was fire, because fire is the only thing that starts and stops.
-21. **The sweep must run BEFORE the empty-read `continue`.** In steady state almost nothing
+22. **The sweep must run BEFORE the empty-read `continue`.** In steady state almost nothing
     transitions, so `xreadgroup` returns empty most of the time — placed after that `continue`,
     the sweep ran only while events were arriving, which is exactly when it is not needed.
-22. **Commit after every DML, even when it matched no rows.** Python's `sqlite3` opens a
+23. **Commit after every DML, even when it matched no rows.** Python's `sqlite3` opens a
     transaction on any DML and holds it until commit; `if rowcount: db.commit()` left an empty
     write transaction open for the life of the process, holding a RESERVED lock. Every other
     writer then failed with "database is locked".
-23. **A transient store error is not a malformed entry.** The event service acks what it cannot
+24. **A transient store error is not a malformed entry.** The event service acks what it cannot
     process, so classifying `OperationalError` as "bad" ACKED AND DISCARDED live events during the
     lock window. Transient errors now retry without acking.
-24. **`store.connect()` sets `row_factory` itself.** A caller that forgets turns `dict(row)` into
+25. **`store.connect()` sets `row_factory` itself.** A caller that forgets turns `dict(row)` into
     "dictionary update sequence element #0 has length 32", an error a long way from its cause.
-25. **sqlite3 connections are thread-bound.** Opening one on the event loop and passing it into
+26. **sqlite3 connections are thread-bound.** Opening one on the event loop and passing it into
     `asyncio.to_thread` raises "SQLite objects created in a thread can only be used in that same
     thread". Open inside the worker.
-26. **Don't write from a read path.** `sync()` rebuilds the FTS index and WAL allows one writer —
+27. **Don't write from a read path.** `sync()` rebuilds the FTS index and WAL allows one writer —
     calling it on a plain listing while the event service is writing gives "database is locked".
 
 ### Evidence clips
 
-27. **`nvurisrcbin` smart-record does NOT work on `file://` sources — only RTSP.** The failure is
+28. **`nvurisrcbin` smart-record does NOT work on `file://` sources — only RTSP.** The failure is
     **silent**: `start_recording()` returns a session id, raises nothing, and no file is written.
     Verified working on RTSP. File mode therefore cuts the clip from the source with
     `ffmpeg -c copy` — stream copy, no re-encode, no GPU.
-28. **Use `buffer_pts`, not `frame_number` or wall-clock, to locate the moment.** `buffer_pts` is
+29. **Use `buffer_pts`, not `frame_number` or wall-clock, to locate the moment.** `buffer_pts` is
     SOURCE time and survives `drop-frame-interval` (measured: 5.2 s wall = 10.3 s source at
     dfi=2). `frame_number` counts DELIVERED frames, so it runs at the analytics rate. Wall-clock
     is meaningless in file mode because the pipeline is not paced to realtime.
-29. **Retention deletes the FILE and keeps the ROW** (`clip_state='expired'`) — the incident
+30. **Retention deletes the FILE and keeps the ROW** (`clip_state='expired'`) — the incident
     happened even if the evidence aged out.
 
 ### The vision model
 
-30. **The VLM answers PERCEPTION questions; the verdict is computed in code.** Asking the model
+31. **The VLM answers PERCEPTION questions; the verdict is computed in code.** Asking the model
     for the verdict directly produced 100% rejections and self-contradictory reasons ("the area
     appears clear of people, with only three individuals visible"). A JSON schema constrains
     shape, not coherence.
-31. **Never tell the prompt that the detector is unreliable.** That primes rejection. Neutral
+32. **Never tell the prompt that the detector is unreliable.** That primes rejection. Neutral
     prompts that only ask what is visible.
-32. **Never ask for a policy judgement without its inputs.** "Does this look crowded" is
+33. **Never ask for a policy judgement without its inputs.** "Does this look crowded" is
     subjective; the occupancy threshold comes from `zones.yml` and the comparison happens in code.
-33. **The subject crop drives the PPE verdict** — crop-only agrees with the default 19/21,
+34. **The subject crop drives the PPE verdict** — crop-only agrees with the default 19/21,
     context-only only 16/21, and context-only rejects twice as often because the model finds
     *somebody* in a vest and answers about the wrong person.
-34. **Cut the crop from the SOURCE at the incident PTS, not from the clip.** The clip's start is
+35. **Cut the crop from the SOURCE at the incident PTS, not from the clip.** The clip's start is
     clamped when an incident opens early AND snaps to a keyframe, so a fixed `pre_roll` seek lands
     in the wrong place. This produced a crop of empty floor that the model still described in
     confident detail — every automated check passed; only looking at the image caught it.
-35. **`-accurate_seek` is an INPUT option.** After `-i`, ffmpeg rejects the whole command.
-36. **`--image-min-tokens 1024` is REQUIRED.** llama-server warns at load time that Qwen-VL models
+36. **`-accurate_seek` is an INPUT option.** After `-i`, ffmpeg rejects the whole command.
+37. **`--image-min-tokens 1024` is REQUIRED.** llama-server warns at load time that Qwen-VL models
     need ≥1024 image tokens for grounding, and Cosmos Reason 2 is a Qwen3-VL model; 448px crops
     fall far below it. Without the flag the model called a traffic cone "a worker in a hi-vis
     vest", reported orange hard hats as yellow, and flipped the same garment between "apron" and
     "vest" on identical input. With it: 12/12 verdicts correct by eye. **Read the model server's
     load-time warnings** — this cost several rounds of prompt engineering and an 8B download, all
     chasing a symptom of a documented misconfiguration.
-37. **A VLM without its `mmproj` projector loads happily and is blind** — it answers from the
+38. **A VLM without its `mmproj` projector loads happily and is blind** — it answers from the
     prompt and will describe a warehouse it never saw. `setup_reasoning.sh` hard-fails without it.
     Control for this by sending a **blank image with a leading prompt**: a grounded model says "no
     people visible", a blind one agrees with you.
-38. **The VLM escalates hazards it was not asked about**, and prose is not a signal. "A large fire
+39. **The VLM escalates hazards it was not asked about**, and prose is not a signal. "A large fire
     is engulfing a cardboard box on the floor" appeared inside a *PPE* incident's `description`,
     where nothing could act on it. Every schema now asks `fire_or_smoke_visible` and
     `hazard_visible` + `hazard_description` as their own fields, and `escalation_for()` decides in
     code. **Never grep the description for "fire"** — that is a hidden list of anticipated hazards,
     and it matches "no fire visible" too.
-39. **An escalated alert must never escalate.** The first run produced `hazard_alert from
+40. **An escalated alert must never escalate.** The first run produced `hazard_alert from
     fire_alert` (a fire IS a hazard) then `fire_alert from hazard_alert` (that hazard IS a fire) —
     one new incident per cycle, each with its own clip and VLM call, forever. Escalation is
     allowed only from detector-originated types.
-40. **State the FINDING first in `vlm_reason`, never the bare description.** A clip carries
+41. **State the FINDING first in `vlm_reason`, never the bare description.** A clip carries
     pre-roll before the event, so the model's one sentence anchors on the calm opening frames:
     confirmed fires read as "a worker in a yellow hard hat walks through an aisle" on every
     human-readable surface while `fire_or_smoke_visible` was correctly `yes`. The verdict was
@@ -383,103 +402,103 @@ These were each hit and diagnosed on a running device. Several contradict the SD
 
 ### The agent
 
-41. **`/no_think` at the start of the system prompt is REQUIRED for Nemotron Nano v2.** It is a
+42. **`/no_think` at the start of the system prompt is REQUIRED for Nemotron Nano v2.** It is a
     reasoning model and its thinking tokens count against `max_tokens`. The OpenAI-style
     `chat_template_kwargs.thinking` and `reasoning_effort` switches are **silently ignored** by
     this build. `/no_think` cuts completion tokens 340–564 → 91–94 and latency 33.7 s → 7.2 s.
     Without it the planner returns `finish_reason: length` with EMPTY content.
-42. **An unbounded string in a JSON schema never terminates under grammar-constrained decoding.**
+43. **An unbounded string in a JSON schema never terminates under grammar-constrained decoding.**
     `text` was `{"type": "string"}`; the planner wrote a correct plan then padded that one field to
     `max_tokens` on EVERY question — 99 of the agent's 105 s. Same prompt without the schema: 1.5 s
     and 29 tokens. Give every free-text field a `maxLength`, set `additionalProperties: false`,
     and keep `max_tokens` tight: **unused budget is free only while generation terminates.**
     `tests/test_agent.py` asserts this statically because it is invisible at runtime.
-43. **A soft fallback hides the failure it protects against.** `ask()` falls back to full-text
+44. **A soft fallback hides the failure it protects against.** `ask()` falls back to full-text
     search when planning throws, so the agent always answered and the only symptom was latency —
     for a whole phase the plan `{'tool': 'search_incidents', 'text': <the whole question>}` was
     read as a weak planner when it is the fallback's literal shape. Always surface `plan_error`.
-44. **Vocabulary for the planner is built from the DATABASE at runtime**, never hardcoded. Keyword
+45. **Vocabulary for the planner is built from the DATABASE at runtime**, never hardcoded. Keyword
     regexes (`helmet` → `ppe_violation`) are a hidden list of anticipated questions.
-45. **A record's `type` is a fact; its `reason` is a description of a few sampled frames.** They
+46. **A record's `type` is a fact; its `reason` is a description of a few sampled frames.** They
     disagree routinely and it is not a contradiction. Asked to show the fire clip, the agent read
     a description that never mentioned fire and answered "the clip of the fire incident is not
     available" — while quoting that exact clip. The type wins.
-46. **The store counts incidents, not people.** There is no headcount denominator, so "what
+47. **The store counts incidents, not people.** There is no headcount denominator, so "what
     percentage of people were not wearing a helmet" has no answer; `by_label` gives the breakdown
     that does exist. Saying which is which beats inventing a rate.
-47. **The model narrates, the database counts.** Aggregate answers carry a per-camera × verdict
+48. **The model narrates, the database counts.** Aggregate answers carry a per-camera × verdict
     table built from SQL, because the LLM reliably narrates three cameras out of nine.
 
 ### Dashboard and API
 
-48. **`/pipeline/status` reports what is RUNNING, not what `demo.yml` says.** It parses the live
+49. **`/pipeline/status` reports what is RUNNING, not what `demo.yml` says.** It parses the live
     process's argv. Reporting the config value made the header read "1 streams" while 12 ran —
     found only by screenshotting the page.
-49. **Browsers cannot play RTSP.** mediamtx republishes as WebRTC (`:8889`, sub-second) and HLS
+50. **Browsers cannot play RTSP.** mediamtx republishes as WebRTC (`:8889`, sub-second) and HLS
     (`:8888`, the iOS-Safari fallback). `webrtcAdditionalHosts: [LANIP]` is required or a remote
     viewer negotiates against loopback and never gets a frame.
-50. **A black video box has three causes with three different fixes** — mediamtx down, mediamtx up
+51. **A black video box has three causes with three different fixes** — mediamtx down, mediamtx up
     with nobody publishing, or the viewer's own WebRTC. `GET /live/status` separates them. The
     middle one is the trap: `POST /rtsp/on` starts the *server*, while the *publisher* is
     `--rtsp-out`, a pipeline **start-time** flag. An encoder cannot be attached to a running
     DeepStream graph, so enabling live view genuinely restarts the pipeline.
-51. **mediamtx's control API (`:9997`) is localhost-only by default.** Curling it from a laptop
+52. **mediamtx's control API (`:9997`) is localhost-only by default.** Curling it from a laptop
     returns `{"status":"error","error":"authentication error"}`, which looks like a broken config
     and is not.
-52. **Browsers cannot play H.265, and evidence clips inherit it.** Chrome needs a platform hardware
+53. **Browsers cannot play H.265, and evidence clips inherit it.** Chrome needs a platform hardware
     decoder and Firefox refuses outright, so every clip sat at `readyState 0` showing a black
     rectangle — indistinguishable from a missing clip. `/clips/{id}` transcodes to H.264 lazily and
     caches beside the original: the capture path stays free, and only clips somebody opens are
     paid for. ~1.9 s for a 12 s clip.
-53. **The alarm fires before the clip exists.** Alert visible at 0.27 s, clip cut at 2–3 s, so the
+54. **The alarm fires before the clip exists.** Alert visible at 0.27 s, clip cut at 2–3 s, so the
     event object captured by `raiseAlarm()` never has a `clip_url`. `openClip()` re-resolves the
     incident and waits for a `pending` clip in the dialog.
-54. **Clips honour HTTP Range** (`206` + `Content-Range`, `416` past EOF). Without it a browser
+55. **Clips honour HTTP Range** (`206` + `Content-Range`, `416` past EOF). Without it a browser
     `<video>` scrub bar is dead and every seek re-downloads the file.
-55. **`/analytics/calendar` reports incidents, not people.** A "how many people had PPE violations"
+56. **`/analytics/calendar` reports incidents, not people.** A "how many people had PPE violations"
     figure was tried as `SUM(hits)` and came out at **23,122 for 20 incidents**, because `hits`
     counts every re-observation of the same situation.
-56. **Never verify live media with a virtual time budget.** It fast-forwards the page's timers, so
+57. **Never verify live media with a virtual time budget.** It fast-forwards the page's timers, so
     the page screenshots before a single WebRTC frame has arrived — a perfectly working stream
     photographs as a black box. Drive a real browser on a real clock and probe
     `videoWidth`/`readyState` instead of trusting pixels.
-57. **Calendar days are LOCAL dates computed in SQL** (`date(ts,'unixepoch','localtime')`) — a
+58. **Calendar days are LOCAL dates computed in SQL** (`date(ts,'unixepoch','localtime')`) — a
     shift starting at 08:00 must not straddle two cells because the server thinks in UTC.
-58. **The donut caps at five zones + Other.** Past that the validated hues stop being separable for
+59. **The donut caps at five zones + Other.** Past that the validated hues stop being separable for
     colour-blind readers. A single zone at 100% is drawn as a `<circle>`, because a full-circle arc
     degenerates to a zero-length path and the slice vanishes.
 
 ### Notifications
 
-59. **At-most-once.** `notify_state` is claimed *before* the network call, and a row left in
+60. **At-most-once.** `notify_state` is claimed *before* the network call, and a row left in
     `sending` by a crash resolves to `failed`, never retried: a duplicate alert is worse than a
     missing one, because the channel is only trustworthy if a message in it means something new.
-60. **Don't select one pending row at a time.** The first version did, and an incident awaiting a
+61. **Don't select one pending row at a time.** The first version did, and an incident awaiting a
     VLM verdict was re-selected forever while every other pending incident starved behind it —
     `--once` never terminated. It works a batch and defers waiting rows in memory.
-61. **Telegram will not preview HEVC** — it arrives as an unplayable attachment. It reuses the
+62. **Telegram will not preview HEVC** — it arrives as an unplayable attachment. It reuses the
     API's `browser_playable()` cache so a clip watched in the dashboard and one pushed to Telegram
     are the same converted file.
 
 ### Operating the device
 
-62. **Never `pkill -f <pattern>` when the pattern also matches your own command line** — over SSH
+63. **Never `pkill -f <pattern>` when the pattern also matches your own command line** — over SSH
     it kills the session itself (exit 255). Bracket-matching (`[l]lama-server`) is **not**
     sufficient: it only stops pkill matching *itself*, while any ancestor command line that
     mentions the pattern still matches. Use `pkill -x <name>` to match the process name exactly,
     or `ps -eo args | grep "[s]weep.sh"` and kill by PID.
-63. **Never launch a process you intend to kill with `nohup setsid ... &`.** `setsid` moves it to
+64. **Never launch a process you intend to kill with `nohup setsid ... &`.** `setsid` moves it to
     a new session, so `$!` captures the transient parent and your cleanup `kill` hits nothing.
     This left **four 20-stream pipelines running concurrently** during a benchmark; each
     successive run measured the contention and apparent throughput fell 941 → 254 fps. Detach the
     *outermost* script, then launch children with a plain `&`. Any benchmark that can be run twice
     must also **refuse to start if a previous instance is still alive.**
-64. **Long jobs must be detached**, not held open over SSH: `nohup setsid bash scripts/... > log
+65. **Long jobs must be detached**, not held open over SSH: `nohup setsid bash scripts/... > log
     2>&1 < /dev/null &`. A benchmark held open by an SSH session dies when the connection blips.
-65. **`~/.bashrc` exports are invisible to `ssh host 'cmd'`.** Ubuntu's default `.bashrc` returns
+66. **`~/.bashrc` exports are invisible to `ssh host 'cmd'`.** Ubuntu's default `.bashrc` returns
     early for non-interactive shells. Secrets belong in `.env`, sourced explicitly via
     `load_env()` in `scripts/env.sh`.
-66. **uvicorn does not hot-reload without `--reload`.** Restart the services after editing.
+67. **uvicorn does not hot-reload without `--reload`.** Restart the services after editing.
 
 ---
 
@@ -568,7 +587,7 @@ sources), `telegram_setup.sh` (find the chat id, send a probe).
 | `demo.yml` | Stream count, source mode, frame intervals, rule thresholds, rendering, sinks. **The main dial.** |
 | `services.yml` | Redis, the store, clip retention, the reasoning endpoint, the notification policy. |
 | `pgie_ppe.yml`, `pgie_fire.yml` | The two detectors: engine, precision, batch, dims, parser, clustering. |
-| `tracker_nvsort_tuned.yml` | The tracker. The stock config outputs nothing — see §6 trap 14. |
+| `tracker_nvsort_tuned.yml` | The tracker. The stock config outputs nothing — see §6 trap 15. |
 | `analytics/zones.yml` | Zone geometry per camera, normalised 0–1. |
 | `analytics/analytics.txt` | Generated from the above — do not edit by hand. |
 | `metamux.txt` | Metadata muxer config for the parallel-inference topology. |

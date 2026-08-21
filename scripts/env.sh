@@ -10,20 +10,44 @@ DS_ROOT="${DS_ROOT:-/opt/nvidia/deepstream/deepstream}"
 DS_SAMPLES="${DS_SAMPLES:-${DS_ROOT}/samples}"
 
 # --- display -------------------------------------------------------------------------------
-# nv3dsink needs a real X display and there is no safe default: on a Jetson running a desktop
-# session the server is often on :1 rather than :0, and guessing wrong fails with an unhelpful
-# "no display found". Set DISPLAY_NUM in .env to pin it; otherwise probe for a live X socket and
-# fall back to :0.
+# Export DISPLAY only when an X server is actually REACHABLE by this user. Otherwise leave it
+# unset and let DeepStream run headless.
+#
+# A set-but-unusable DISPLAY is worse than no DISPLAY at all. nvbufsurftransform tries to open an
+# EGL display against it and the pipeline dies with:
+#
+#     nvbufsurftransform: Could not get EGL display connection
+#     nvinfer <pgie_fire> error: Failed to set buffer pool to active
+#     Unable to set the pipeline to the playing state.
+#
+# which reads as an inference fault and is nothing of the kind. Diagnosed on a device whose X
+# socket existed at :0 but belonged to the gdm greeter — root-owned, no xauth cookie for the
+# service user — so merely finding a socket proves nothing. `xdpyinfo` is the actual test.
+#
+# Set DISPLAY_NUM in .env to force a specific display (skips the probe entirely).
+# Needs `xdpyinfo` (x11-utils, installed by scripts/setup.sh). If it is missing the probe can
+# never succeed and every run goes headless — the safe direction to fail, since the cost is a
+# lost local preview rather than a dead pipeline.
 detect_display() {
-  local d
+  local d n
   for d in /tmp/.X11-unix/X*; do
     [ -e "$d" ] || continue
-    echo ":${d##*/X}"
-    return 0
+    n=":${d##*/X}"
+    if DISPLAY="$n" xdpyinfo >/dev/null 2>&1; then
+      echo "$n"
+      return 0
+    fi
   done
-  echo ":0"
+  return 1
 }
-export DISPLAY="${DISPLAY_NUM:-$(detect_display)}"
+
+if [ -n "${DISPLAY_NUM:-}" ]; then
+  export DISPLAY="$DISPLAY_NUM"
+else
+  unset DISPLAY
+  _d="$(detect_display)" && export DISPLAY="$_d"
+  unset _d
+fi
 
 # --- demo media contract -------------------------------------------------------------------
 # H.265 is not a preference. 20 concurrent 1080p30 streams is 91% of the measured AGX Orin NVDEC

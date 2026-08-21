@@ -61,8 +61,11 @@ step "[1/8] system packages"
 # libmosquitto1 is not optional despite looking like an MQTT dependency this project has no use
 # for: libnvds_nvmultiobjecttracker.so dlopens it, and without it the tracker fails to load with
 # "Failed to initilaize low level lib" — a message that names the tracker, not the library.
+# x11-utils supplies xdpyinfo, which is how scripts/env.sh decides whether an X server is
+# actually reachable rather than merely present. Without it the probe cannot succeed and every
+# run falls back to headless — safe, but it silently gives up the local preview.
 PKGS=(ffmpeg mediainfo bc curl git make cmake build-essential
-      python3-venv python3-yaml redis-server libmosquitto1)
+      python3-venv python3-yaml redis-server libmosquitto1 x11-utils)
 if [ "$SKIP_APT" = 1 ]; then
   echo "    --skip-apt: skipping"
 else

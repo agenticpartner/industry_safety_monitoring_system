@@ -512,17 +512,32 @@ def resolve_sources(cfg: dict, count: int, mode: str) -> list[str]:
     return [f"file://{os.path.abspath(f)}" for f in files[:count]]
 
 
-def _detect_display() -> str:
-    """First live X socket, or ":0".
+def _detect_display() -> str | None:
+    """First X display this user can actually TALK to, or None for headless.
 
-    There is no safe constant here: a Jetson running a desktop session commonly puts the X
-    server on :1, and nv3dsink against the wrong number fails with "no display found" rather
-    than anything that points at the cause.
+    A socket in /tmp/.X11-unix proves an X server exists, not that we may connect to it — on a
+    device sitting at the login screen, :0 belongs to the display manager's greeter and is
+    root-owned with no xauth cookie for the service user. So each candidate is probed with
+    `xdpyinfo` rather than assumed.
+
+    Returning None matters as much as returning a display. A set-but-unusable DISPLAY makes
+    nvbufsurftransform fail its EGL init and the whole pipeline refuses to reach PLAYING with
+    "Could not get EGL display connection" — reported against nvinfer, which is not the cause.
+    Unset, DeepStream takes the headless path and everything works.
     """
     import glob
+    import subprocess
     for sock in sorted(glob.glob("/tmp/.X11-unix/X*")):
-        return ":" + sock.rsplit("/X", 1)[-1]
-    return ":0"
+        disp = ":" + sock.rsplit("/X", 1)[-1]
+        try:
+            probe = subprocess.run(["xdpyinfo"], env={**os.environ, "DISPLAY": disp},
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue          # no xdpyinfo installed, or it hung — treat as unusable
+        if probe.returncode == 0:
+            return disp
+    return None
 
 
 def tile_layout(count: int, cfg: dict) -> tuple[int, int]:
@@ -734,6 +749,13 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
 
     # ---- sinks ----
     want_display = cfg["sinks"]["display"].get("enabled", True) and not args.no_display
+    # Configured-on is not the same as available. Dropping the sink costs a local preview;
+    # keeping it against an unreachable X server costs the entire pipeline (see _detect_display).
+    if want_display and not (os.environ.get("DISPLAY") or _detect_display()):
+        print("!! display sink enabled but no reachable X server — running headless.\n"
+              "!!   The dashboard and RTSP output are unaffected. Set DISPLAY_NUM in .env "
+              "to force one.", flush=True)
+        want_display = False
     want_rtsp = cfg["sinks"]["rtsp_out"].get("enabled", False) or args.rtsp_out
 
     sink_type = "nv3dsink" if platform.processor() == "aarch64" else "nveglglessink"
@@ -892,11 +914,13 @@ def main() -> int:
         # (scripts/env.sh probes /tmp/.X11-unix for a live X socket). Pin it in the config only
         # when auto-detection picks the wrong server — nv3dsink fails with an unhelpful
         # "no display found" against the wrong number.
-        _disp = cfg["sinks"]["display"].get("display")
+        _disp = cfg["sinks"]["display"].get("display") or _detect_display()
         if _disp:
             os.environ.setdefault("DISPLAY", str(_disp))
-        elif not os.environ.get("DISPLAY"):
-            os.environ["DISPLAY"] = _detect_display()
+        else:
+            # Explicitly clear it: an inherited DISPLAY pointing at a server we cannot reach is
+            # what breaks EGL, so headless must mean genuinely unset.
+            os.environ.pop("DISPLAY", None)
 
     rows, cols = tile_layout(args.streams, cfg)
     _dfi = (args.drop_frame_interval if args.drop_frame_interval is not None
