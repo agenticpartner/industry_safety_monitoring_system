@@ -80,10 +80,10 @@ question is whether it keeps up. Measured on 20 cameras over the LAN:
 | Capacity, same configuration | **484.6 fps** against 300 needed — **1.6×** |
 | GPU, steady state | ~30% |
 
-**Realtime, with 1.6× headroom.** The rig itself feeds ~190 fps rather than the ~290 the cameras
-send — that is ingest, not compute (70% of the GPU is idle). Twenty TCP streams from one host
-over one NIC, and `nvstreammux` drops frames that miss its 40 ms batch window. Real cameras are
-separate devices; don't read ~190 fps as a Jetson limit.
+**Realtime, with 1.6× headroom.** The analytics rate on this rig is ~190 fps against the ~290 the
+cameras send, and the gap is ingest rather than compute — 70% of the GPU is idle. Twenty TCP
+streams arrive from one host over one NIC and `nvstreammux` drops whatever misses its 40 ms batch
+window. Real cameras are separate devices, so that ceiling is the simulator's, not the Jetson's.
 
 ---
 
@@ -298,24 +298,22 @@ sources:
     - rtsp://10.0.0.13:554/cam/realmonitor?channel=1&subtype=0   # Dahua
 ```
 
-- **List position is the camera id** — zones, the OSD and clip names all key on it. Reordering
-  renames every camera.
-- Credentials in a URL end up in git. Keep `demo.yml` out of the repo, or move them to `.env`.
-- Leave `rtsp_urls` empty to fall back to `rtsp_base` + `rtsp_pattern` (the demo's numbered
-  mounts).
-- `sources.rtsp` sets reconnect, TCP and a 200 ms jitterbuffer. Keep reconnect on:
-  `nvurisrcbin` defaults it to *never*, so one blip blacks out that camera until restart.
+List position is the camera id — zones, the OSD and clip names all key on it. An empty
+`rtsp_urls` falls back to `rtsp_base` + `rtsp_pattern`, the demo's numbered mounts on one server.
 
-To simulate cameras, run the server **on another machine** — never the Jetson, or you measure
-your own CPU:
+`sources.rtsp` carries reconnect, TCP transport and a 200 ms jitterbuffer. Reconnect is the one
+that matters: `nvurisrcbin` defaults it to *never*, so a camera that blips goes black until the
+pipeline restarts.
+
+The simulator from earlier serves the same purpose here, from another machine:
 
 ```bash
 ./scripts/serve_rtsp_sources.sh start 20   # prints the rtsp_base line to paste in
 ```
 
-Note it loops a compressed stream, which restarts the GOP and occasionally makes the fire
-detector fire on decode smear. Artifact of the simulator, not the detector — the same footage in
-file mode detects nothing.
+It loops a compressed stream, which restarts the GOP and occasionally makes the fire detector
+fire on decode smear — an artifact of the simulator, not the detector. The same footage in file
+mode detects nothing.
 
 ### Evidence over RTSP
 
