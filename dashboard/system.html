@@ -338,6 +338,31 @@
       reached 723.8 fps on traffic footage — <b>tracker cost scales with people, not pixels</b>,
       and the warehouse number is the one that counts.
     </p>
+    <h3>Live RTSP cameras</h3>
+    <p class="lede">The capacity table above is <b>file mode</b>, run flat out — that is what
+       measures the ceiling. Live sources are paced by the cameras, so throughput can never
+       exceed realtime and the useful question becomes whether the box keeps up. Measured on 20
+       cameras served over the LAN.</p>
+    <div class="wrap"><table>
+      <tr><th>Measure</th><th>Value</th><th>What it means</th></tr>
+      <tr><td>Delivered by each camera</td><td>27.5–30 fps</td>
+          <td>~580 fps aggregate ingest across 20 streams</td></tr>
+      <tr><td>Analytics rate seen by the probe</td><td>~190 fps</td>
+          <td>against ~290 fps implied by what arrives</td></tr>
+      <tr><td>Jetson capacity, same config</td><td><b>484.6 fps</b></td>
+          <td>vs a 300 fps realtime requirement — <b>1.6× headroom</b></td></tr>
+      <tr><td>GPU, steady state</td><td>~30%</td><td>3–57% once the VLM backlog drains</td></tr>
+      <tr><td>GPU, during a VLM burst</td><td>99%</td><td>cold start, ~18 incidents queued</td></tr>
+    </table></div>
+    <div class="note">
+      <b>The gap is ingest, not compute.</b> With 70% of the GPU idle the pipeline cannot be the
+      constraint. Twenty concurrent TCP RTSP streams arrive from a single host over one NIC, and
+      <code>nvstreammux</code> in <code>live-source</code> mode batches on a 40 ms timeout without
+      waiting for stragglers — so jittered frames miss their batch. Real cameras are independent
+      devices with their own uplinks; the same footage in file mode runs at 484 fps on this box.
+      Treat ~190 fps as a property of the demo rig, not of the Jetson.
+    </div>
+
     <h3>Tuning with a measurable cost</h3>
     <div class="wrap"><table>
       <tr><th>Setting</th><th>Alternative</th><th>In use</th><th>Measured difference</th></tr>
@@ -410,17 +435,29 @@
 
   <section class="card">
     <h2>Latency, end to end</h2>
+    <p class="lede">File sources (left) and live RTSP cameras (right). The two differ mainly in
+       how evidence is captured, and that difference propagates into every clock downstream.</p>
     <div class="wrap"><table>
-      <tr><th>Stage</th><th>p50</th><th>p90</th><th>max</th><th>What it covers</th></tr>
-      <tr><td>Detection → alert visible</td><td>0.27 s</td><td>0.56 s</td><td>0.59 s</td>
+      <tr><th>Stage</th><th>file p50</th><th>RTSP p50</th><th>RTSP p90</th><th>What it covers</th></tr>
+      <tr><td>Detection → alert visible</td><td>0.27 s</td><td><b>0.12 s</b></td><td>0.19 s</td>
           <td>rule fires → Redis → store → queryable</td></tr>
-      <tr><td>Evidence clip ready</td><td>2.11 s</td><td>3.36 s</td><td>3.61 s</td>
-          <td>ffmpeg stream-copy from the source</td></tr>
-      <tr><td>VLM verdict</td><td colspan="3">5–10 s each, <b>serial</b></td>
+      <tr><td>Evidence clip ready</td><td>2.11 s</td><td>11.09 s</td><td>12.18 s</td>
+          <td>ffmpeg stream-copy · vs smart record</td></tr>
+      <tr><td>VLM verdict</td><td>12.49 s</td><td>22.93 s</td><td>69.96 s</td>
+          <td>waits for the clip, then queues</td></tr>
+      <tr><td>VLM inference alone</td><td colspan="3">~6.7 s per call (5.6–8.9 s), <b>serial</b></td>
           <td>crop + inference + decision</td></tr>
       <tr><td>Agent answer</td><td colspan="3">11.2 s idle · 23.8 s at 20 streams</td>
           <td>plan + retrieve + synthesise</td></tr>
     </table></div>
+    <div class="note">
+      <b>Why the clip is slower over RTSP, and why that is not a regression.</b> A file source is
+      already on disk, so the window can be cut the moment the incident lands. A live camera has
+      to be <i>recorded</i>: smart record dumps <code>pre_roll + post_roll</code> from its ring
+      buffer, so the file cannot exist until that window has physically elapsed. The VLM clock
+      inherits the wait — 22.9 s p50 is 11 s of clip plus queueing, against 6.7 s of actual
+      inference. The p90 of 70 s is a cold-start burst, not steady state.
+    </div>
     <div class="note">
       <b>The alert is instant; the adjudication is not.</b> An incident appears in under a second
       marked <code>unverified</code> and its verdict lands later. Adjudication is serial by
