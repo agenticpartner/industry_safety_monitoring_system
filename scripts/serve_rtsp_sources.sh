@@ -93,21 +93,26 @@ EOF
     # -c copy keeps the existing H.265 elementary stream: no re-encode, so this machine can
     # comfortably push 20 streams without becoming the bottleneck.
     #
-    # -fflags +genpts is NOT optional, and it is not a codec detail. `-stream_loop -1` restarts
-    # the file's timestamps at every loop, and the resulting discontinuity reaches the Jetson as
-    # a glitched frame — DeepStream says so out loud ("Invalid PTS found in stream"). A smeared
-    # block of warm pixels is exactly what a fire/smoke detector is looking for, so a real
-    # camera farm that loops a 40s clip invents fire on innocent cameras every 40 seconds.
+    # A NOTE ON LOOPING, because it produces two symptoms that look like product bugs:
     #
-    # Measured on cam14/cam16, same footage, three ways:
-    #   file mode                          0 fire/smoke detections
-    #   RTSP, no loop boundary             0
-    #   RTSP, -stream_loop, no genpts      4 false fire incidents in 12 min, 27 PTS warnings
-    #   RTSP, -stream_loop, WITH genpts    0, and 0 PTS warnings
+    #   * occasional fire/smoke detections on cameras with no fire in them, and
+    #   * smart-record clips longer than the duration that was requested.
     #
-    # The same discontinuity also inflated smart-record clips from the requested 12s to 38-40s.
-    # Regenerating timestamps at the loop point costs nothing and removes both.
-    nohup ffmpeg -hide_banner -loglevel error -fflags +genpts -stream_loop -1 -re -i "$f" \
+    # Both come from republishing a COMPRESSED stream in a loop. `-c copy` restarts the GOP
+    # without re-sending parameter sets, so the Jetson's decoder loses reference frames — visible
+    # as "Could not find ref with POC", "Error constructing the frame RPS" on the receiving end.
+    # A smeared block of warm pixels is exactly what a fire detector is built to notice.
+    #
+    # The media itself is fine: decoding media/camNN.mp4 straight from disk gives ZERO errors,
+    # and file-mode pipeline runs over the same footage detect no fire at all. Real cameras
+    # encode natively for RTSP and do not restart a GOP mid-session, so none of this reaches a
+    # production install — which is why the fix belongs here and not in a detector threshold.
+    #
+    # `-fflags +genpts` was tried and REVERTED. It does silence the "Invalid PTS" warnings, but
+    # measured delivery over 12s: 317 frames plain vs 216 with genpts. Paying 30% of the frame
+    # rate to partly mask a rig artifact that the VLM already rejects downstream is the wrong
+    # trade — the pipeline dropped from ~300 fps to ~190 against a 300 fps realtime target.
+    nohup ffmpeg -hide_banner -loglevel error -stream_loop -1 -re -i "$f" \
       -an -c:v copy -f rtsp -rtsp_transport tcp \
       "rtsp://127.0.0.1:${PORT}/$(printf 'cam%02d' "$i")" >/dev/null 2>&1 &
     echo $! >> "$PIDS"

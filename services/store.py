@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS events (
     -- USED later: only the ffmpeg path has a local source that source_pts_ns actually indexes
     -- into, and the reasoning service must not seek into a file the timestamps do not belong to.
     clip_mode    TEXT,
+    -- Crop of the flagged subject, captured by the pipeline at the instant of detection.
+    crop_uri     TEXT,
     -- Phase 2.9: outbound notification (Telegram).
     notify_state TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | skipped | failed
     notify_ts    REAL,
@@ -128,6 +130,7 @@ COLUMNS = {
     "clip_state": "TEXT NOT NULL DEFAULT 'pending'",
     "clip_error": "TEXT",
     "clip_mode": "TEXT",
+    "crop_uri": "TEXT",
     # Outbound notification (Phase 2.9). Recorded in the incident row rather than in the notifier's
     # own state, so "was this alert sent, and when" survives a restart of the notifier and is
     # answerable with a SELECT — the same reason clip and VLM state live here.
@@ -257,6 +260,30 @@ class EventStore:
 
     def count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def attach_crop(self, rec: dict) -> str:
+        """Record a subject crop against the incident its transition belongs to.
+
+        Resolved through `incident_tracks`, NOT by event_id. The pipeline names a crop for the
+        TRANSITION that triggered it, and the store folds transitions into incidents — measured
+        on a live run, only 1 of 138 crops carried an id that was itself an incident row. Every
+        other one belonged to a real incident and would have been thrown away. The track mapping
+        is the thing that actually knows which incident a transition joined.
+        """
+        row = self.db.execute(
+            "SELECT event_id FROM incident_tracks "
+            " WHERE camera_id = ? AND type = ? AND track_id = ?",
+            (rec.get("camera_id"), rec.get("type"), rec.get("track_id"))).fetchone()
+        target = row[0] if row else rec.get("event_id")
+        if not target:
+            return "crop-unmatched"
+        # First crop wins: it is the one closest to when the incident opened, and a later
+        # transition's subject may be a different person entirely.
+        cur = self.db.execute(
+            "UPDATE events SET crop_uri = ? WHERE event_id = ? AND crop_uri IS NULL",
+            (rec.get("crop_uri"), target))
+        self.db.commit()
+        return "crop-attached" if cur.rowcount else "crop-unmatched"
 
     def attach_clip(self, event_id: str, clip_uri: str) -> str:
         """Record a finished smart-record clip against its incident.

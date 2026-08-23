@@ -60,7 +60,9 @@ from events import (  # noqa: E402
     SEVERITY_RANK,
 )
 
-from pyservicemaker import Pipeline, Probe, BatchMetadataOperator, osd  # noqa: E402
+from pyservicemaker import (  # noqa: E402
+    Pipeline, Probe, BatchMetadataOperator, BufferOperator, osd,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 UNTRACKED = 0xFFFFFFFFFFFFFFFF
@@ -923,6 +925,187 @@ class SmartRecorder:
                     self.failed += 1
 
 
+class FrameCapture(BufferOperator):
+    """Crops the violating subject out of the LIVE frame, at the instant it was flagged.
+
+    ## Why this and not a crop from the evidence clip
+
+    Both other routes are eliminated by measurement, not preference. Cropping the source at the
+    incident PTS is meaningless over RTSP — `source_pts_ns` is running time on a live stream and
+    indexes no file. Cropping the smart-record clip fails at EVERY offset: an offset sweep found
+    the subject in 1 of 4 cases at best and 0 of 4 at most offsets, because a stored bbox and a
+    clip describe different moments by construction (the bbox is from the transition that opened
+    the incident; the clip is recorded later, and incidents merge many tracks over time).
+
+    Here the frame and the box come from the same instant, so that mismatch cannot arise.
+
+    ## The valve is the whole reason this is affordable
+
+    Extraction needs an RGB NVMM surface, which needs an `nvvideoconvert` the main path cannot
+    supply (`nvdsosd` takes NV12 or RGBA only). So the branch is a tee behind a valve that DROPS
+    by default: with the gate shut no buffer reaches the convert and `handle_buffer` is never
+    called at all — measured at 20 streams as 481.3 vs 484.6 fps, i.e. nothing. The gate opens
+    only while a crop is owed, which makes the captured frame about one frame later than the
+    detection (~66 ms at 15 fps analytics) rather than exact. That is a different order of error
+    from the clip attempt this replaces.
+
+    Cost when it does run: 8.58 ms p50 end to end. The crop is taken on the GPU and only the crop
+    is copied to host — moving the whole 1080p frame would be ~6 MB a time.
+
+    ## One crop per incident, not per transition
+
+    The probe emits an opening event per TRACK, and on this footage that is a near-continuous
+    stream: 2360 crops in three minutes across 20 cameras. Each request opens the gate, so at
+    that rate the gate is NEVER shut and the RGB convert runs on every frame of every stream —
+    precisely the cost the valve exists to avoid. Measured that way: 174-235 fps against a 300
+    fps realtime target, i.e. the pipeline stops keeping up. The gating is only as good as the
+    trigger rate behind it.
+
+    So requests are rate-limited per (camera, type) on the store's own `merge_window_s`. Not an
+    arbitrary throttle: inside that window the store MERGES transitions into a single incident,
+    so the second and later crops describe an incident that already has one. The first request
+    after a quiet period is the one that opens the incident, and that is the crop worth taking.
+    """
+
+    def __init__(self, pipeline: Pipeline, emitter, crops_dir: Path, streams: int,
+                 cooldown_s: float = 30.0, pad: float = 0.35, width: int = 448,
+                 valve: str = "cap_valve"):
+        super().__init__()
+        # Imported here, not at module scope: the pipeline must still run on plain system python
+        # when capture is off, and torch only exists in the --system-site-packages venv.
+        from torch.utils.dlpack import from_dlpack  # noqa: PLC0415
+        import cv2  # noqa: PLC0415
+        self._from_dlpack = from_dlpack
+        self._cv2 = cv2
+        self.pipeline = pipeline
+        self.emitter = emitter
+        self.crops_dir = crops_dir
+        self.streams = streams
+        self.pad = pad
+        self.width = width
+        self.valve = valve
+        self.cooldown_s = float(cooldown_s)
+        self._cool: dict[tuple[int, str], float] = {}
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._pending: dict[int, list[tuple[str, tuple]]] = {}   # 0-based stream -> [(id, bbox)]
+        self._gate_open = False
+        self.captured = 0
+        self.failed = 0
+        self.skipped = 0
+        self.merged = 0
+
+    def stats(self) -> dict[str, int]:
+        return {"captured": self.captured, "failed": self.failed, "no_bbox": self.skipped,
+                "merged": self.merged}
+
+    # -- called from the probe thread -------------------------------------------------------
+    def request(self, ev) -> None:
+        """Ask for a crop of this incident's subject. Never blocks, never raises."""
+        bbox = getattr(ev, "bbox", None)
+        if not bbox or len(bbox) != 4:
+            # Overcrowding and fire have no subject box — the scene is the evidence, and
+            # context frames already serve them.
+            self.skipped += 1
+            return
+        sid = ev.camera_id - 1
+        if not (0 <= sid < self.streams):
+            return
+        now = time.monotonic()
+        key = (ev.camera_id, ev.type)
+        with self._lock:
+            if now < self._cool.get(key, 0.0):
+                # Same situation as one already captured; the store will merge this transition
+                # into the incident that crop belongs to.
+                self.merged += 1
+                return
+            self._cool[key] = now + self.cooldown_s
+            self._pending.setdefault(sid, []).append(
+                (ev.event_id, tuple(bbox), ev.type, ev.track_id))
+            need_open = not self._gate_open
+            self._gate_open = True
+        if need_open:
+            self._gate(False)          # valve `drop` False == gate OPEN
+
+    def _gate(self, drop: bool) -> None:
+        try:
+            self.pipeline[self.valve].set({"drop": drop})
+        except Exception as e:  # noqa: BLE001
+            self.failed += 1
+            print(f"[capture] valve {'close' if drop else 'open'} failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    # -- streaming thread, only while the gate is open ---------------------------------------
+    def handle_buffer(self, buffer) -> None:
+        # Wrapped whole: an exception escaping a probe is SIGABRT, not a traceback.
+        try:
+            with self._lock:
+                if not self._pending:
+                    return
+            for frame in buffer.batch_meta.frame_items:
+                sid = frame.source_id
+                with self._lock:
+                    reqs = self._pending.pop(sid, None)
+                if not reqs:
+                    continue
+                # batch_id, NOT source_id: extract() indexes the position in this batch, and a
+                # partial batch makes the two diverge.
+                gpu = self._from_dlpack(buffer.extract(frame.batch_id))
+                for event_id, bbox, etype, track_id in reqs:
+                    self._write(gpu, bbox, event_id, sid + 1, etype, track_id)
+        except Exception as e:  # noqa: BLE001
+            self.failed += 1
+            if self.failed <= 3:
+                print(f"[capture] {type(e).__name__}: {e}", flush=True)
+        finally:
+            with self._lock:
+                done = not self._pending
+                if done and self._gate_open:
+                    self._gate_open = False
+                else:
+                    done = False
+            if done:
+                self._gate(True)
+
+    def _write(self, gpu, bbox, event_id: str, camera_id: int, etype: str,
+               track_id: int) -> None:
+        h, w = int(gpu.shape[0]), int(gpu.shape[1])
+        left, top, bw, bh = (float(v) for v in bbox)
+        px, py = bw * self.pad, bh * self.pad
+        x0 = max(0, min(w - 2, int(left - px)))
+        y0 = max(0, min(h - 2, int(top - py)))
+        x1 = max(x0 + 2, min(w, int(left + bw + px)))
+        y1 = max(y0 + 2, min(h, int(top + bh + py)))
+        # Crop on the GPU, then copy only the crop across.
+        host = gpu[y0:y1, x0:x1].contiguous().cpu().numpy()
+        if self.width and host.shape[1] > self.width:
+            scale = self.width / host.shape[1]
+            host = self._cv2.resize(
+                host, (self.width, max(1, int(host.shape[0] * scale))),
+                interpolation=self._cv2.INTER_AREA)
+        ok, enc = self._cv2.imencode(".jpg", host[:, :, ::-1],   # RGB surface -> BGR for cv2
+                                     [self._cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            self.failed += 1
+            return
+        # Named for the incident, which is the whole contract with the reasoning service: it
+        # looks for this path and needs no schema change or extra message to find it.
+        path = self.crops_dir / f"{event_id}.jpg"
+        path.write_bytes(enc.tobytes())
+        self.captured += 1
+        # Report it the way clips are reported. The store resolves this to an incident through
+        # `incident_tracks` on (camera, type, track) rather than by event_id: the crop is named
+        # for a TRANSITION, and measured on a live run only 1 of 138 transitions is itself an
+        # incident row — every other crop would be discarded on an event_id match.
+        try:
+            uri = str(path.relative_to(ROOT))
+        except ValueError:
+            uri = str(path)
+        self.emitter.emit_raw({"kind": "crop_ready", "event_id": event_id,
+                               "camera_id": camera_id, "type": etype, "track_id": track_id,
+                               "crop_uri": uri})
+
+
 def tile_layout(count: int, cfg: dict) -> tuple[int, int]:
     rows, cols = cfg["pipeline"]["tiler"].get("rows"), cfg["pipeline"]["tiler"].get("cols")
     if rows and cols:
@@ -1427,9 +1610,31 @@ def main() -> int:
         # Both are set here rather than inside SmartRecorder so the emitter has exactly one
         # owner deciding its policy, and so a run with recording disabled leaves the event
         # payloads byte-identical to the file-mode ones.
-        emitter.on_open = recorder.request
         emitter.clip_mode = "smart_record"
         print(f"[smart-rec] enabled: {clips_dir} (-{pre_s}s +{post_s}s per incident)", flush=True)
+
+    capture = None
+    if emitter is not None and args.rgb_capture:
+        capture = FrameCapture(pipeline, emitter, ROOT / "data/crops", args.streams,
+                               cooldown_s=float((svc.get("store") or {}).get("merge_window_s", 30)))
+        # Attached to the convert, i.e. downstream of the valve — so while the gate is shut this
+        # operator is not called at all, rather than called and returning early.
+        pipeline.attach("cap_conv", Probe("frame-capture", capture))
+        print(f"[capture] writing subject crops to {ROOT / 'data/crops'}", flush=True)
+
+    # One hook, several consumers. Fanned out here rather than chaining assignments so a new
+    # consumer cannot silently replace an existing one — and so a raising hook cannot stop the
+    # others: this runs on the streaming thread, where an escaping exception is SIGABRT.
+    hooks = [h for h in (recorder.request if recorder else None,
+                         capture.request if capture else None) if h]
+    if hooks and emitter is not None:
+        def _on_open(ev, _hooks=tuple(hooks)):
+            for h in _hooks:
+                try:
+                    h(ev)
+                except Exception:  # noqa: BLE001
+                    pass
+        emitter.on_open = _on_open
 
     pipeline.start()
 
@@ -1450,6 +1655,8 @@ def main() -> int:
     overlay.report_track_stability()
     if recorder is not None:
         print(f"[smart-rec] final: {recorder.stats()}", flush=True)
+    if capture is not None:
+        print(f"[capture] final: {capture.stats()}", flush=True)
     if emitter is not None:
         emitter.close()
         print(f"[events] final: {emitter.stats()}", flush=True)

@@ -681,7 +681,7 @@ def main() -> int:
         # that matter.
         row = db.execute(
             "SELECT event_id, camera_id, type, severity, label, zone, bbox, clip_uri, "
-            "       source_pts_ns, clip_mode "
+            "       source_pts_ns, clip_mode, crop_uri "
             "  FROM events "
             " WHERE state = ? AND clip_state = 'ready' AND clip_uri IS NOT NULL "
             " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, ts "
@@ -694,7 +694,7 @@ def main() -> int:
             continue
 
         (event_id, camera_id, etype, severity, label, zone, bbox_json, clip_uri, pts_ns,
-         clip_mode) = row
+         clip_mode, crop_uri) = row
         clip = ROOT / clip_uri
         if not clip.exists():
             db.execute("UPDATE events SET state = ?, vlm_reason = ? WHERE event_id = ?",
@@ -739,7 +739,18 @@ def main() -> int:
         #
         # Overcrowding keeps the context frames because its question is "how many people are in
         # this scene" — there is no subject to crop, and the scene IS the evidence.
+        # A crop captured by the pipeline at the moment of detection, if the capture branch is
+        # running. This is the only crop that can be trusted over RTSP: the frame and the bbox
+        # were taken at the same instant, so none of the offset guesswork that defeated
+        # clip-cropping applies. Presence of the file IS the signal — no schema change, and an
+        # incident from before the branch existed simply has none.
+        probe_crop = (ROOT / crop_uri) if crop_uri else None
+        have_probe_crop = bool(probe_crop and probe_crop.exists()
+                               and probe_crop.stat().st_size > 0)
+
         mode = args.images
+        if mode == "auto" and have_probe_crop and etype == "ppe_violation":
+            mode = "probe_crop"
         if mode == "auto":
             # Crop-only is the right answer for PPE **when the crop can be trusted**, which
             # requires cutting it from the source at the incident's own PTS. Without a local
@@ -759,7 +770,11 @@ def main() -> int:
             # more often, because the model can answer about the wrong person — but it is
             # answering about the actual scene, which a crop of empty floor never was.
             mode = "crop" if (etype == "ppe_violation" and have_source) else "context"
-        imgs = frames.build(clip, bbox, source, offset, mode=mode)
+        if mode == "probe_crop":
+            # Already a finished crop of exactly the flagged subject — nothing to extract.
+            imgs = [probe_crop]
+        else:
+            imgs = frames.build(clip, bbox, source, offset, mode=mode)
         if not imgs:
             db.execute("UPDATE events SET state = ?, vlm_reason = ? WHERE event_id = ?",
                        (ST_UNVERIFIED, "could not extract frames from clip", event_id))
@@ -770,7 +785,7 @@ def main() -> int:
         zone_txt = f", zone '{zone}'" if zone else ""
         prompt = PROMPTS.get(etype, PROMPTS["ppe_violation"]).format(
             camera_id=camera_id, zone_txt=zone_txt, cannot_tell=CANNOT_TELL)
-        if mode == "crop" and etype == "ppe_violation":
+        if mode in ("crop", "probe_crop") and etype == "ppe_violation":
             # Only one image is sent, so "the final image is a close crop" is misleading.
             prompt = prompt.replace(
                 " The final image is a close crop of one object the system is tracking.",

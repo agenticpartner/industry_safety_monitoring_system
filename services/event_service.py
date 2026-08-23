@@ -147,7 +147,9 @@ def main() -> int:
                     # rather than transitions to fold into one. Only smart record uses this so
                     # far, to report the evidence clip it just finished writing. Events have no
                     # `kind`, which is what keeps the common path untouched.
-                    if rec.get("kind") == "clip_ready":
+                    if rec.get("kind") == "crop_ready":
+                        what = store.attach_crop(rec)
+                    elif rec.get("kind") == "clip_ready":
                         what = store.attach_clip(rec["event_id"], rec["clip_uri"])
                     else:
                         what = store.apply(rec)
