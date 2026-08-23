@@ -43,6 +43,7 @@ import argparse
 import glob
 import os
 import platform
+import queue
 import sys
 import threading
 import time
@@ -500,6 +501,20 @@ def load_zone_severity(streams: int) -> dict[int, dict[str, str]]:
 
 def resolve_sources(cfg: dict, count: int, mode: str) -> list[str]:
     if mode == "rtsp":
+        # Explicit per-camera URLs win when present. This is the production path: real cameras
+        # are individual devices with their own hostnames, credentials and vendor-specific paths
+        # (`rtsp://user:pw@10.0.0.5/Streaming/Channels/101`), and no printf pattern spans a
+        # mixed fleet. `rtsp_base` + `rtsp_pattern` stays for the demo, where twenty streams do
+        # come off one server with numbered mounts.
+        urls = [u for u in (cfg["sources"].get("rtsp_urls") or []) if str(u).strip()]
+        if urls:
+            if len(urls) < count:
+                raise SystemExit(
+                    f"sources.rtsp_urls lists {len(urls)} camera(s) but {count} streams were "
+                    f"requested — add the missing URLs or lower pipeline.streams")
+            # Camera N is urls[N-1]: the position in this list IS the camera id the dashboard,
+            # the zone config and the clip prefixes all key on.
+            return [str(u).strip() for u in urls[:count]]
         base = cfg["sources"]["rtsp_base"].rstrip("/")
         pattern = cfg["sources"]["rtsp_pattern"]
         return [f"{base}/{pattern % (i + 1)}" for i in range(count)]
@@ -538,6 +553,374 @@ def _detect_display() -> str | None:
         if probe.returncode == 0:
             return disp
     return None
+
+
+# Incident types urgent enough to interrupt a camera's post-recording cooldown. The cooldown is
+# only a disk-and-churn guard, and a fire is exactly the thing nobody should later discover had
+# no video because the camera was resting. Kept as types rather than a severity test because
+# severity is escalated by zone — a routine violation in a forklift aisle is `high`, and that
+# should not preempt.
+PREEMPT_TYPES = frozenset({"fire_alert", "hazard_alert"})
+
+_RTP_TRANSPORT = {"auto": 7, "udp": 1, "udp-mcast": 2, "tcp": 4, "http": 10, "tls": 20}
+
+
+def rtsp_props(cfg: dict) -> dict:
+    """Reconnection and transport settings for live RTSP sources.
+
+    **`rtsp-reconnect-interval` defaults to 0, which means never reconnect.** A camera that
+    stops sending — a network blip, a PoE reset, a switch reboot — is then gone for the life of
+    the pipeline: the source posts EOS, nvstreammux retires it, and that tile stays black with
+    nothing in the log but a single "Could not read from resource". Observed here on 3 of 20
+    streams (cam06, cam10, cam17) during a routine run, on a quiet LAN with all 20 publishers
+    still healthy. On real cameras this is not an edge case, it is Tuesday.
+
+    Transport defaults to TCP rather than the element's `udp-udpmcast-tcp`. Twenty 1080p streams
+    is enough traffic that UDP datagram loss shows up as exactly the read failures above, and
+    RTSP-over-TCP costs a little latency to remove a whole class of them. Set
+    `sources.rtsp.transport: auto` to restore the element default.
+    """
+    r = (cfg.get("sources") or {}).get("rtsp") or {}
+    transport = str(r.get("transport", "tcp")).lower()
+    if transport not in _RTP_TRANSPORT:
+        print(f"[rtsp] unknown transport {transport!r}, falling back to tcp", flush=True)
+        transport = "tcp"
+    return {
+        # Force a reconnect when no data has arrived for this long.
+        "rtsp-reconnect-interval": int(r.get("reconnect_interval_s", 10)),
+        # And when the FIRST connection errors, so a camera that is slow to boot — or a demo
+        # started before its source server — is retried instead of abandoned.
+        "init-rtsp-reconnect-interval": int(r.get("init_reconnect_interval_s", 10)),
+        # -1 = keep trying. A camera that has been down for an hour should still rejoin.
+        "rtsp-reconnect-attempts": int(r.get("reconnect_attempts", -1)),
+        "select-rtp-protocol": _RTP_TRANSPORT[transport],
+        # Jitterbuffer. 100 ms (the default) is tight for anything crossing a real network.
+        "latency": int(r.get("latency_ms", 200)),
+        # Be explicit: the property help says smart record needs source-type-rtsp, and relying
+        # on URI-scheme auto-detection makes evidence capture depend on a guess.
+        "type": 2,
+    }
+
+
+def load_services_cfg() -> dict:
+    path = ROOT / "configs/services.yml"
+    return yaml.safe_load(path.read_text()) if path.exists() else {}
+
+
+def clip_settings(svc: dict) -> tuple[Path, int, int, int]:
+    """(clips_dir, pre_roll_s, post_roll_s, cache_s) from services.yml.
+
+    Read from the SAME keys `clip_service.py` uses, so an evidence clip is the same length
+    whichever backend produced it and the two paths cannot drift apart.
+    """
+    clips = (svc.get("clips") or {})
+    d = Path(clips.get("dir", "data/clips"))
+    if not d.is_absolute():
+        d = ROOT / d
+    pre = int(clips.get("pre_roll_s", 6))
+    return (d, pre, int(clips.get("post_roll_s", 6)),
+            int(clips.get("cache_s", pre * 2 + 5)))
+
+
+def _smart_record_props(cfg: dict, args) -> dict | None:
+    """nvurisrcbin smart-record properties, or None when it is switched off."""
+    if getattr(args, "no_smart_record", False):
+        return None
+    svc = load_services_cfg()
+    clips_dir, pre_s, post_s, cache_s = clip_settings(svc)
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    # The ring buffer has to hold the pre-roll PLUS however long the trigger took to reach the
+    # recorder — see the lag compensation in SmartRecorder._dispatch, which spends that margin.
+    if cache_s <= pre_s:
+        print(f"[smart-rec] WARNING clips.cache_s={cache_s}s does not cover pre_roll_s={pre_s}s "
+              f"— clips will be missing part of the lead-up", flush=True)
+    return {
+        # 2 = smart-rec-multi: respond to BOTH cloud messages and local/API events. 1 (cloud) is
+        # the common copy-paste value and would ignore Pipeline.start_recording() entirely.
+        "smart-record": 2,
+        # The cache is the ONLY history that exists over RTSP; a cache shorter than the pre-roll
+        # silently truncates the part of the clip an operator actually wants (the lead-up).
+        "smart-rec-cache": cache_s,
+        "smart-rec-dir-path": str(clips_dir),
+        "smart-rec-container": 0,            # MP4
+        "smart-rec-mode": 1,                 # video only — these streams carry no audio
+        # Backstop if a stop event never arrives, so a stuck recording cannot grow without bound.
+        "smart-rec-default-duration": pre_s + post_s,
+    }
+
+
+class SmartRecorder:
+    """Evidence clips for RTSP sources, cut from nvurisrcbin's own ring buffer.
+
+    ## Why this exists at all
+
+    In `file` mode `clip_service.py` cuts the window out of `media/camNN.mp4` with `ffmpeg -c
+    copy`, locating the moment by `source_pts_ns`. That is impossible over RTSP: the Jetson never
+    has the source, only the live stream passing through it. Production cameras are separate
+    network devices, so this is the REAL deployment shape, not a corner case — and smart record is
+    the mechanism DeepStream provides for it. `nvurisrcbin` continuously caches the incoming
+    ENCODED stream (`smart-rec-cache` seconds of it) and can dump a window out of that cache on
+    demand: no decode, no re-encode, and the clip comes out at the full SOURCE frame rate rather
+    than the `drop-frame-interval` analytics rate. Measured on this build: 1080p30 H.265 out of a
+    15 fps analytics pipeline.
+
+    It is RTSP-only, and not by choice — `smart-rec-container` says so in its own property help
+    ("Sources must be of type source-type-rtsp") and file sources fail SILENTLY, returning a
+    session id and writing nothing.
+
+    ## Off the hot path
+
+    `request()` is called from inside the DeepStream probe, i.e. on the GStreamer streaming
+    thread, so it only puts a tuple on a bounded queue. A worker thread does the
+    `start_recording()` call, exactly as `EventEmitter` defers its socket writes — the hot path
+    must never wait on the clip layer.
+
+    ## One recording per camera at a time, shared by every incident inside it
+
+    The probe emits one transition per TRACK, but a clip belongs to a moment on a CAMERA: five
+    people starting a violation together are five events and one piece of video. So a camera
+    already recording does not start a second overlapping recording; the later events attach to
+    the one in flight and all of them end up pointing at the same file. That mirrors what the
+    store does with incidents, and it is why the pending list is a shared mutable list — events
+    arriving mid-window land in the list the callback will read.
+
+    **A camera is released by its CALLBACK, never by a timer.** An earlier version expired the
+    window after `pre+post` seconds, which raced: the window opened up a fraction before the
+    callback arrived, the next event started a fresh recording and replaced the pending list, and
+    the in-flight callback then attached its clip to the wrong events while the incident that
+    triggered it sat in `clip_state='recording'` forever. Measured on a 20-camera run: 159
+    recordings started, 20 files produced, 4 incidents orphaned. Completion is the only honest
+    signal that a source is free again; the deadline below is a watchdog, not the normal path.
+
+    **A source must be explicitly stopped before it will record again**, and this is the part
+    that is not in any documentation. `smart-rec-default-duration` ends the recording, writes the
+    file and fires the callback — but leaves the element's session OPEN. Every later
+    `start_recording()` on that source is then refused with `Element srcN is already recording`,
+    printed by the element and invisible to the caller, which still returns a session id. Probed
+    directly: refused at callback+5s and still refused at callback+50s, i.e. it never clears on
+    its own. Without the `stop_recording()` in `_rearm()` below, each camera yields exactly ONE
+    evidence clip per pipeline lifetime and every incident after the first silently gets none.
+
+    The callback can also fire TWICE for one recording (same filename, same instant — once for
+    the auto-stop and once for the explicit stop), so completions are de-duplicated by filename.
+
+    ## An incident with no clip is a correct outcome
+
+    Smart record can only run one session per camera at a time, so a camera cannot always be
+    recording when an incident opens. When it cannot, the incident gets NO clip and says so —
+    it is never pointed at a nearby file. A clip covers `[trigger-pre, trigger+post]` and
+    nothing else; attaching one that ends before the incident began produces evidence of a
+    different moment, which the VLM then adjudicates in good faith and gets wrong. `fire_alert`
+    and `hazard_alert` preempt the cooldown so the incidents that most need video are the least
+    likely to go without.
+    """
+
+    def __init__(self, pipeline: Pipeline, emitter, clips_dir: Path,
+                 pre_s: int, post_s: int, streams: int, cooldown_s: float = 30.0,
+                 cache_s: int = 17):
+        self.pipeline = pipeline
+        self.emitter = emitter
+        self.clips_dir = clips_dir
+        # The binding is start_recording(str, int, int, Callable[[RecordingInfo], None]) -> int:
+        # both times are ints and a float raises TypeError.
+        self.pre_s = max(1, int(pre_s))
+        self.post_s = max(1, int(post_s))
+        self.cache_s = max(self.pre_s, int(cache_s))
+        self.streams = streams
+        self.cooldown_s = float(cooldown_s)
+        self._q: queue.Queue = queue.Queue(maxsize=512)
+        self._lock = threading.Lock()
+        self._active: set[int] = set()               # cameras with a recording in flight
+        self._deadline: dict[int, float] = {}        # watchdog: callback overdue past this
+        self._cooldown_until: dict[int, float] = {}  # cam_id -> monotonic, set on completion
+        self._pending: dict[int, list[str]] = {}     # cam_id -> event_ids sharing that recording
+        self._seen_files: set[str] = set()           # completions already handled (dedupe)
+        self.started = 0
+        self.completed = 0
+        self.failed = 0
+        self.attached = 0
+        self.stalled = 0
+        self.skipped = 0     # incidents that got no clip because the camera was cooling down
+        self.lagged = 0      # triggers that reached the worker more than 1s late
+        threading.Thread(target=self._run, name="smart-recorder", daemon=True).start()
+
+    # -- called from the probe -------------------------------------------------------------
+    def request(self, ev) -> None:
+        """Ask for a clip covering this moment. Never blocks, never raises."""
+        try:
+            # The request time is carried, not read at dispatch: the worker can be several
+            # seconds behind during a burst, and the pre-roll has to reach back to the moment
+            # the incident actually happened rather than to whenever we got round to it.
+            self._q.put_nowait(("record", ev.camera_id,
+                                (ev.event_id, ev.type, ev.severity, time.monotonic())))
+        except queue.Full:
+            self.failed += 1
+
+    def stats(self) -> dict[str, int]:
+        return {"started": self.started, "done": self.completed,
+                "attached": self.attached, "failed": self.failed,
+                "stalled": self.stalled, "no_clip": self.skipped,
+                "lagged": self.lagged}
+
+    # -- worker ---------------------------------------------------------------------------
+    def _run(self) -> None:
+        while True:
+            try:
+                kind, camera_id, payload = self._q.get()
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if kind == "rearm":
+                    self._rearm(camera_id)
+                else:
+                    self._dispatch(camera_id, *payload)
+            except Exception as e:  # noqa: BLE001
+                self.failed += 1
+                print(f"[smart-rec] {kind} failed cam{camera_id:02d}: "
+                      f"{type(e).__name__}: {e}", flush=True)
+
+    def _rearm(self, camera_id: int) -> None:
+        """Close the finished session so this source can record again.
+
+        Done on the worker rather than inside the completion callback, which runs on a
+        DeepStream thread that should not be held. Only after the stop lands is the camera
+        marked free — releasing it earlier would let the next event issue a `start_recording()`
+        that the element silently refuses.
+        """
+        try:
+            self.pipeline.stop_recording(f"src{camera_id - 1}")
+        except Exception as e:  # noqa: BLE001
+            self.failed += 1
+            print(f"[smart-rec] cam{camera_id:02d} stop_recording failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+        with self._lock:
+            self._active.discard(camera_id)
+            self._deadline.pop(camera_id, None)
+            self._cooldown_until[camera_id] = time.monotonic() + self.cooldown_s
+
+    def _dispatch(self, camera_id: int, event_id: str, etype: str = "",
+                  severity: str = "", requested_at: float | None = None) -> None:
+        if not (1 <= camera_id <= self.streams):
+            return
+        now = time.monotonic()
+        total = self.pre_s + self.post_s
+        with self._lock:
+            if camera_id in self._active:
+                if now < self._deadline.get(camera_id, 0.0):
+                    # A recording is in flight RIGHT NOW, so it genuinely covers this moment —
+                    # attaching is truthful. This is the only sharing that is.
+                    self._pending.setdefault(camera_id, []).append(event_id)
+                    self.attached += 1
+                    return
+                # Watchdog. The callback is long overdue, so treat the session as lost rather
+                # than leaving this camera unable to record for the rest of the run. The
+                # incidents waiting on it are released to `clip_service`'s stuck-row sweep,
+                # which marks them failed with a reason.
+                self._active.discard(camera_id)
+                self._pending.pop(camera_id, None)
+                self.stalled += 1
+                print(f"[smart-rec] cam{camera_id:02d} recording never completed — releasing",
+                      flush=True)
+            if now < self._cooldown_until.get(camera_id, 0.0) and etype not in PREEMPT_TYPES:
+                # Cooling down, and this is not urgent enough to interrupt it. The incident gets
+                # NO clip, and that is the correct answer.
+                #
+                # An earlier version pointed it at the clip recorded just before, to reach 100%
+                # coverage. That was wrong in the way that matters: a clip only covers
+                # [trigger-pre, trigger+post], and anything arriving during the cooldown is by
+                # definition after that window has closed — so the attached video could never
+                # contain the incident. It was caught in the field, not by a test: a SMOKE alert
+                # on cam14 carried a clip ending 10.6 s before the smoke was detected, the VLM
+                # dutifully reported "no flames or smoke visible", and a CRITICAL fire alert was
+                # rejected on footage of a different moment. Coverage is not the goal; evidence
+                # that shows the incident is.
+                self.skipped += 1
+                return
+        with self._lock:
+            self._active.add(camera_id)
+            # Generous grace: the file is only finalised after the full window has elapsed.
+            self._deadline[camera_id] = now + total + 30.0
+            self._pending[camera_id] = [event_id]
+
+        # Reach back past the dispatch lag as well as the pre-roll. `start_time` is measured
+        # from NOW, not from when the incident happened, so a trigger that waited behind
+        # nineteen other cameras would otherwise produce a clip that begins after the moment it
+        # is meant to document. Measured before this compensation: 7 of 29 incidents had clips
+        # starting up to 11.9 s AFTER the incident — evidence of the aftermath, not the event.
+        #
+        # Bounded by the ring buffer, which is all the history that exists; a lag longer than
+        # the cache cannot be recovered, and the clip then starts as early as it can.
+        lag = max(0.0, now - requested_at) if requested_at else 0.0
+        start_back = int(min(self.cache_s, self.pre_s + lag))
+        sid = self.pipeline.start_recording(f"src{camera_id - 1}", start_back,
+                                            total + start_back - self.pre_s, self._on_done)
+        self.started += 1
+        if lag > 1.0:
+            self.lagged += 1
+        print(f"[smart-rec] cam{camera_id:02d} recording session={sid} "
+              f"(-{start_back}s +{self.post_s}s, lag {lag:.1f}s) for {event_id[:8]}", flush=True)
+
+    # -- completion callback (called from a DeepStream thread) -----------------------------
+    def _on_done(self, info) -> None:
+        """Publish the finished clip against every incident that was waiting on it.
+
+        Wrapped whole: this is invoked from C++, so an escaping exception aborts the process
+        rather than raising — the same trap the metadata probe is written around.
+        """
+        cam_id = 0
+        try:
+            name = getattr(info, "file_name", "") or ""
+            directory = getattr(info, "file_directory", "") or str(self.clips_dir)
+            # The camera comes from the filename, not the session id. Every source sets its own
+            # `smart-rec-file-prefix` (cam07_...), and session ids restart per source — the
+            # 20-stream run returned session=0 for all twenty — so the prefix is the only
+            # unambiguous way back to the camera.
+            #
+            # Split on the separator rather than slicing two characters: nvurisrcbin appends
+            # `_<sessionid>_<counter>_<timestamp>_<pid>`, so the prefix is everything before the
+            # first underscore and a fixed [3:5] slice would silently read cam100 as camera 10.
+            head = name.split("_", 1)[0]
+            if head[:3] == "cam" and head[3:].isdigit():
+                cam_id = int(head[3:])
+            with self._lock:
+                # One recording can fire this callback twice with the same filename — once for
+                # the auto-stop, once for our explicit stop. Claiming the pending list twice
+                # would attach the clip and then log the same file as unwanted.
+                duplicate = name in self._seen_files
+                if not duplicate:
+                    self._seen_files.add(name)
+                    event_ids = self._pending.pop(cam_id, [])
+            if duplicate:
+                return
+            path = Path(directory) / name
+            try:
+                uri = str(path.relative_to(ROOT))
+            except ValueError:
+                # Stored relative to the repo root when possible so the database stays portable
+                # between the device and a laptop copy; absolute otherwise.
+                uri = str(path)
+            self.completed += 1
+            for eid in event_ids:
+                self.emitter.emit_raw({"kind": "clip_ready", "event_id": eid, "clip_uri": uri})
+            if event_ids:
+                print(f"[smart-rec] cam{cam_id:02d} -> {name} "
+                      f"({path.stat().st_size / 1e6:.1f} MB) for {len(event_ids)} incident(s)",
+                      flush=True)
+            else:
+                print(f"[smart-rec] {name} finished with no incident waiting on it", flush=True)
+        except Exception as e:  # noqa: BLE001
+            self.failed += 1
+            print(f"[smart-rec] callback error: {type(e).__name__}: {e}", flush=True)
+        finally:
+            # ALWAYS re-arm, on every exit path including the error one. A camera whose session
+            # is never stopped is a camera that silently produces no further evidence for the
+            # rest of the run, which is the worst possible failure for this feature — it looks
+            # exactly like "no incidents happened".
+            if cam_id:
+                try:
+                    self._q.put_nowait(("rearm", cam_id, None))
+                except queue.Full:
+                    self.failed += 1
 
 
 def tile_layout(count: int, cfg: dict) -> tuple[int, int]:
@@ -619,12 +1002,35 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
     # the decoder, so recordings stay a full 30 fps.
     dfi = int(args.drop_frame_interval if args.drop_frame_interval is not None
               else cfg["pipeline"].get("drop_frame_interval", 0) or 0)
+    # Smart record, RTSP only. `nvurisrcbin` keeps `smart-rec-cache` seconds of the incoming
+    # ENCODED stream and can dump a window out of it on demand, which is the only way to get an
+    # evidence clip when the source is a camera on the network rather than a file on disk.
+    # File sources fail SILENTLY here (a session id is returned and nothing is written), so this
+    # is gated on the mode rather than left on and hoped for.
+    sr = _smart_record_props(cfg, args) if mode == "rtsp" else None
+    # Reconnection and transport. Live sources only: these properties are meaningless for
+    # file:// and setting `type=rtsp` on one would be a lie the element acts on.
+    rtsp = rtsp_props(cfg) if mode == "rtsp" else None
+    if rtsp is not None:
+        print(f"[rtsp] transport={[k for k, v in _RTP_TRANSPORT.items() if v == rtsp['select-rtp-protocol']][0]}"
+              f" reconnect={rtsp['rtsp-reconnect-interval']}s"
+              f" latency={rtsp['latency']}ms", flush=True)
+
     for i, uri in enumerate(uris):
         props = {"uri": uri}
+        if rtsp is not None:
+            props.update(rtsp)
         if mode == "file" and cfg["sources"].get("loop", True):
             props["file-loop"] = 1
         if dfi > 0:
             props["drop-frame-interval"] = dfi
+        if sr is not None:
+            props.update(sr)
+            # Unique per source: the completion callback reports a filename but not which camera
+            # produced it, so the prefix is what carries that back. The property help says the
+            # same thing ("for unique file names every source must be provided with a unique
+            # prefix"), and sharing one prefix would also let two cameras overwrite each other.
+            props["smart-rec-file-prefix"] = f"cam{i + 1:02d}"
         p.add("nvurisrcbin", f"src{i}", props)
 
     p.add("nvstreammux", "mux", {
@@ -887,6 +1293,10 @@ def main() -> int:
                          "comparable to Phase 1")
     ap.add_argument("--no-events", action="store_true",
                     help="force events off even if services.yml enables them")
+    ap.add_argument("--no-smart-record", action="store_true",
+                    help="disable nvurisrcbin smart-record evidence clips in rtsp mode. Clips "
+                         "are the only way to get evidence video off a live camera, so this is "
+                         "for isolating its cost, not for normal running")
     ap.add_argument("--track-stats", action="store_true",
                     help="report per-track id lifetimes when the run ends. Use to verify that "
                          "tracking still holds ids long enough to debounce after changing "
@@ -952,6 +1362,25 @@ def main() -> int:
         print(f"[events] publishing transitions to redis://{r.get('host', '127.0.0.1')}:"
               f"{r.get('port', 6379)}/{r.get('stream', 'safety:events')}", flush=True)
 
+    # Smart record rides on the emitter: it needs somewhere to report the finished filename, and
+    # the event stream is already the channel every other incident fact travels on. No emitter
+    # means no way to tell anyone a clip exists, so there is nothing to enable.
+    recorder = None
+    if emitter is not None and args.source == "rtsp" and not args.no_smart_record:
+        clips_dir, pre_s, post_s, cache_s = clip_settings(svc)
+        # Cooldown is purely a disk-and-churn guard now, NOT a correctness mechanism — nothing
+        # is attached during it, so a longer one only means more incidents with no video. Kept
+        # short and tied to the clip's own tail; `clips.cooldown_s` in services.yml overrides.
+        cooldown = float((svc.get("clips") or {}).get("cooldown_s", post_s))
+        recorder = SmartRecorder(pipeline, emitter, clips_dir, pre_s, post_s, args.streams,
+                                 cooldown_s=cooldown, cache_s=cache_s)
+        # Both are set here rather than inside SmartRecorder so the emitter has exactly one
+        # owner deciding its policy, and so a run with recording disabled leaves the event
+        # payloads byte-identical to the file-mode ones.
+        emitter.on_open = recorder.request
+        emitter.clip_mode = "smart_record"
+        print(f"[smart-rec] enabled: {clips_dir} (-{pre_s}s +{post_s}s per incident)", flush=True)
+
     pipeline.start()
 
     # pipeline.wait() blocks inside C++, so Python signal handlers never run — SIGINT and
@@ -969,6 +1398,8 @@ def main() -> int:
     # Only reachable on a clean stop (EOS). `timeout --signal=KILL` bypasses this, which is why
     # both of these also report periodically from inside the probe.
     overlay.report_track_stability()
+    if recorder is not None:
+        print(f"[smart-rec] final: {recorder.stats()}", flush=True)
     if emitter is not None:
         emitter.close()
         print(f"[events] final: {emitter.stats()}", flush=True)

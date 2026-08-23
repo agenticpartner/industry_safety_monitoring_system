@@ -267,7 +267,8 @@ def escalation_for(etype: str, obs: dict) -> tuple[str, str, str, str] | None:
 
 def escalate(emitter, alert_type: str, severity: str, label: str, why: str,
              camera_id: int, zone: str | None, pts_ns: int | None,
-             obs: dict, from_event_id: str) -> None:
+             obs: dict, from_event_id: str,
+             clip_uri: str | None = None, clip_mode: str | None = None) -> None:
     """Publish an escalated alert on the normal event path.
 
     Emitted as an open/close PAIR with a unique track id, exactly like `POST /alerts/test`, and
@@ -275,9 +276,13 @@ def escalate(emitter, alert_type: str, severity: str, label: str, why: str,
     every other synthetic emission on that camera and gets silently absorbed as a duplicate,
     while leaving an incident open forever that swallows all later ones.
 
-    `source_pts_ns` is carried over from the originating incident, so the escalated alert gets
-    its own evidence clip cut from the same moment in the source — which is the whole point:
-    the operator is being asked to LOOK.
+    The escalation **inherits the originating incident's clip**, and that is the most accurate
+    evidence available: this alert exists precisely because the model saw the hazard in those
+    frames. It also avoids re-deriving one, which cannot work here — over RTSP the pipeline is
+    the only thing that can record, and it never sees these synthetic events, while
+    `source_pts_ns` is live-stream running time that indexes nothing on disk. Left to the file
+    path, a hazard alert was cut from `media/camNN.mp4` at `pts % duration` and showed an
+    unrelated moment.
     """
     from events import Event  # noqa: PLC0415 — dependency-free module, imported lazily
 
@@ -285,6 +290,7 @@ def escalate(emitter, alert_type: str, severity: str, label: str, why: str,
     track = -(abs(hash(from_event_id)) % 2_000_000_000) - 2
     common = dict(camera_id=camera_id, type=alert_type, severity=severity,
                   track_id=track, label=label, zone=zone, source_pts_ns=pts_ns,
+                  clip_uri=clip_uri, clip_mode=clip_mode,
                   vlm_verdict=CONFIRMED,
                   vlm_reason=f"{why} seen by the VLM while reviewing incident "
                              f"{from_event_id[:8]}. {desc}"[:600])
@@ -444,11 +450,29 @@ class FrameSet:
             f.unlink()
         out: list[Path] = []
 
-        # Context frames spread across the clip. Downscaled to 640 wide: the VLM does not need
-        # 1080p to tell a person from a traffic cone, and request size drives latency.
+        # Context frames spread across the WHOLE clip. Downscaled to 640 wide: the VLM does not
+        # need 1080p to tell a person from a traffic cone, and request size drives latency.
+        #
+        # The span is measured, never assumed. It used to be the constant 12 — pre_roll +
+        # post_roll, correct only for clips this service cuts itself. Smart-record clips are
+        # whatever length the camera's ring buffer yields (22-40 s observed), so a fixed 12 s
+        # window showed the model the opening of the clip and hid everything after it.
+        #
+        # That is not a cosmetic sampling detail. Measured on three cam07 fire incidents, the
+        # first-12s frames returned `fire_or_smoke_visible: no` on all three and frames spread
+        # over the full clip returned `yes` on all three — "a burning box emitting flames and
+        # smoke", "a fire engulfing a section of the shelves". Critical fire alerts were being
+        # rejected because the adjudicator was never shown the fire. The model was right every
+        # time about the pictures it was given.
+        #
+        # (n-1) rather than n in the numerator so the last sample lands at the END of the clip
+        # instead of three quarters through it — the incident is usually past the pre-roll, and
+        # with fire the evidence tends to grow over the clip rather than shrink.
+        span = probe_duration(clip) or float(self.pre_roll_s * 2)
+        step = max(1, self.n_frames - 1)
         if mode in ("both", "context") and self._run(
                 ["ffmpeg", "-y", "-loglevel", "error", "-i", str(clip),
-                 "-vf", f"fps={self.n_frames}/12,scale=640:-2",
+                 "-vf", f"fps={step}/{max(span, 1.0):.3f},scale=640:-2",
                  "-frames:v", str(self.n_frames),
                  str(self.work_dir / "ctx_%02d.jpg")]):
             out.extend(sorted(self.work_dir.glob("ctx_*.jpg")))
@@ -657,7 +681,7 @@ def main() -> int:
         # that matter.
         row = db.execute(
             "SELECT event_id, camera_id, type, severity, label, zone, bbox, clip_uri, "
-            "       source_pts_ns "
+            "       source_pts_ns, clip_mode "
             "  FROM events "
             " WHERE state = ? AND clip_state = 'ready' AND clip_uri IS NOT NULL "
             " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, ts "
@@ -669,7 +693,8 @@ def main() -> int:
             time.sleep(args.interval)
             continue
 
-        event_id, camera_id, etype, severity, label, zone, bbox_json, clip_uri, pts_ns = row
+        (event_id, camera_id, etype, severity, label, zone, bbox_json, clip_uri, pts_ns,
+         clip_mode) = row
         clip = ROOT / clip_uri
         if not clip.exists():
             db.execute("UPDATE events SET state = ?, vlm_reason = ? WHERE event_id = ?",
@@ -691,6 +716,17 @@ def main() -> int:
             src_dur = probe_duration(source)
             source_durations[source] = src_dur
         offset = ((pts_ns / 1e9) % src_dur) if (pts_ns and src_dur) else None
+
+        # Can `source_pts_ns` actually be used to seek into that file?
+        #
+        # NOT the same question as "does the file exist". A Jetson that has ever run in file mode
+        # still has media/camNN.mp4 sitting there, and over RTSP those timestamps are running
+        # time on a live stream — `pts % duration` then indexes a frame with no relationship to
+        # the incident. That is precisely what produced nine confident rejections of empty floor:
+        # the file was present, the seek was arithmetically valid, and the frame was arbitrary.
+        #
+        # The incident itself records which backend produced its evidence, so ask that.
+        have_source = clip_mode != "smart_record" and source.exists()
         # Per-type image policy. This is NOT a tuning preference — it was measured by rendering
         # the crops and adjudicating them by eye (bench/reasoning.md §3):
         #
@@ -705,7 +741,24 @@ def main() -> int:
         # this scene" — there is no subject to crop, and the scene IS the evidence.
         mode = args.images
         if mode == "auto":
-            mode = "crop" if etype == "ppe_violation" else "context"
+            # Crop-only is the right answer for PPE **when the crop can be trusted**, which
+            # requires cutting it from the source at the incident's own PTS. Without a local
+            # source that is not possible: `source_pts_ns` is running time on a live stream, not
+            # an offset into a file, and the smart-record clip's internal geometry is not
+            # predictable — measured on this build, a clip requested as 12 s came back at 38-40 s,
+            # so the incident is nowhere near `pre_roll` in.
+            #
+            # A crop taken at a guessed offset does not fail loudly, it fails CONFIDENTLY: nine
+            # consecutive PPE incidents were rejected with "the tracked object is not a person"
+            # over descriptions of "a close-up view of a concrete floor" and "a dark, smooth
+            # floor". The detector was right every time and the adjudicator overruled it from a
+            # picture of the ground.
+            #
+            # So over RTSP the verdict is made from context frames spread across the clip. That
+            # is measurably weaker than a good crop (16/21 vs 19/21 agreement) and it rejects
+            # more often, because the model can answer about the wrong person — but it is
+            # answering about the actual scene, which a crop of empty floor never was.
+            mode = "crop" if (etype == "ppe_violation" and have_source) else "context"
         imgs = frames.build(clip, bbox, source, offset, mode=mode)
         if not imgs:
             db.execute("UPDATE events SET state = ?, vlm_reason = ? WHERE event_id = ?",
@@ -770,7 +823,8 @@ def main() -> int:
         if esc is not None:
             alert_type, esc_sev, esc_label, why = esc
             escalate(emitter, alert_type, esc_sev, esc_label, why,
-                     camera_id, zone, pts_ns, obs, event_id)
+                     camera_id, zone, pts_ns, obs, event_id,
+                     clip_uri=clip_uri, clip_mode=clip_mode)
             counts[f"escalated-{alert_type}"] = counts.get(f"escalated-{alert_type}", 0) + 1
             print(f"[reasoning] ESCALATED {alert_type} from {etype} {event_id[:8]} "
                   f"cam{camera_id:02d} | {esc_label}", flush=True)

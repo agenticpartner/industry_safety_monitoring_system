@@ -297,5 +297,77 @@ class TestReRaise(StoreTest):
         self.assertEqual(self.store.raise_stale(0, now=now), [])
 
 
+class TestSmartRecordClips(StoreTest):
+    """Evidence clips produced by the PIPELINE rather than by `clip_service`.
+
+    Over RTSP there is no local source file to cut from, so `nvurisrcbin` dumps the clip out of
+    its own ring buffer and the pipeline reports the filename afterwards. Two things have to hold
+    for that hand-off to be safe: `clip_service` must not adopt these incidents (it would mark
+    them failed, having no source), and a late or duplicated report must not overwrite evidence
+    that is already settled.
+    """
+
+    def _clip_state(self, event_id: str):
+        r = self.store.db.execute(
+            "SELECT clip_state, clip_uri FROM events WHERE event_id = ?", (event_id,)).fetchone()
+        return (r[0], r[1]) if r else (None, None)
+
+    def test_smart_record_incident_opens_as_recording_not_pending(self):
+        # 'pending' is clip_service's work queue. An incident it can never cut must not be in it.
+        e = ev(1, ts=time.time())
+        e["clip_mode"] = "smart_record"
+        e["source_pts_ns"] = 123
+        self.store.apply(e)
+        self.assertEqual(self._clip_state(e["event_id"])[0], "recording")
+
+    def test_file_mode_incident_still_opens_as_pending(self):
+        e = ev(1, ts=time.time())
+        e["source_pts_ns"] = 123
+        self.store.apply(e)
+        self.assertEqual(self._clip_state(e["event_id"])[0], "pending")
+
+    def test_attach_clip_moves_recording_to_ready(self):
+        e = ev(1, ts=time.time())
+        e["clip_mode"] = "smart_record"
+        self.store.apply(e)
+        self.assertEqual(self.store.attach_clip(e["event_id"], "data/clips/cam03.mp4"),
+                         "clip-attached")
+        self.assertEqual(self._clip_state(e["event_id"]), ("ready", "data/clips/cam03.mp4"))
+
+    def test_attach_clip_for_an_unknown_incident_is_not_an_error(self):
+        # The pipeline reports one clip per TRACK that was waiting on it, but the store folds
+        # those tracks into one incident — so most reports legitimately match no row.
+        self.assertEqual(self.store.attach_clip("never-inserted", "x.mp4"), "clip-unmatched")
+
+    def test_attach_clip_does_not_overwrite_a_settled_clip(self):
+        # A duplicate callback must not re-point a row an operator may already have opened, nor
+        # resurrect one whose file retention has since deleted.
+        e = ev(1, ts=time.time())
+        e["clip_mode"] = "smart_record"
+        self.store.apply(e)
+        self.store.attach_clip(e["event_id"], "first.mp4")
+        self.assertEqual(self.store.attach_clip(e["event_id"], "second.mp4"), "clip-unmatched")
+        self.assertEqual(self._clip_state(e["event_id"])[1], "first.mp4")
+
+    def test_incident_arriving_with_its_own_clip_opens_ready(self):
+        # VLM escalations inherit the clip the hazard was seen in. Nothing downstream could
+        # produce one for them — the pipeline never saw the synthetic event, and over RTSP
+        # source_pts_ns indexes no local file — so anything but 'ready' strands them.
+        e = ev(1, ts=time.time(), etype="hazard_alert")
+        e["clip_uri"] = "data/clips/inherited.mp4"
+        e["clip_mode"] = "smart_record"
+        self.store.apply(e)
+        self.assertEqual(self._clip_state(e["event_id"]),
+                         ("ready", "data/clips/inherited.mp4"))
+
+    def test_expired_clip_is_not_resurrected(self):
+        e = ev(1, ts=time.time())
+        e["clip_mode"] = "smart_record"
+        self.store.apply(e)
+        self.store.db.execute("UPDATE events SET clip_state='expired' WHERE event_id=?",
+                              (e["event_id"],))
+        self.assertEqual(self.store.attach_clip(e["event_id"], "late.mp4"), "clip-unmatched")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

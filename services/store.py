@@ -55,8 +55,14 @@ CREATE TABLE IF NOT EXISTS events (
     open_tracks  INTEGER NOT NULL DEFAULT 0,
     -- Phase 2.3: where in the SOURCE video this incident began, and the clip cut from it.
     source_pts_ns INTEGER,
-    clip_state   TEXT NOT NULL DEFAULT 'pending',   -- pending | ready | failed | skipped
+    clip_state   TEXT NOT NULL DEFAULT 'pending',   -- pending | ready | failed | skipped | recording
     clip_error   TEXT,
+    -- Which backend produced the evidence: NULL/'ffmpeg' (cut from media/camNN.mp4 at
+    -- source_pts_ns) or 'smart_record' (dumped from the live RTSP ring buffer by the pipeline).
+    -- Recorded per incident rather than read from config because it decides how the clip may be
+    -- USED later: only the ffmpeg path has a local source that source_pts_ns actually indexes
+    -- into, and the reasoning service must not seek into a file the timestamps do not belong to.
+    clip_mode    TEXT,
     -- Phase 2.9: outbound notification (Telegram).
     notify_state TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | skipped | failed
     notify_ts    REAL,
@@ -121,6 +127,7 @@ COLUMNS = {
     "source_pts_ns": "INTEGER",
     "clip_state": "TEXT NOT NULL DEFAULT 'pending'",
     "clip_error": "TEXT",
+    "clip_mode": "TEXT",
     # Outbound notification (Phase 2.9). Recorded in the incident row rather than in the notifier's
     # own state, so "was this alert sent, and when" survives a restart of the notifier and is
     # answerable with a SELECT — the same reason clip and VLM state live here.
@@ -169,6 +176,27 @@ def connect(path: Path | str) -> sqlite3.Connection:
     db.executescript(INDICES)
     db.commit()
     return db
+
+
+def _initial_clip_state(ev: dict) -> str:
+    """Which clip backend, if any, owns this incident's evidence video.
+
+    * `recording` — the PIPELINE is cutting it, right now, out of nvurisrcbin's ring buffer
+      (RTSP sources). `clip_service` must not touch these: there is no local source file it
+      could cut from, so it would only mark them failed. The row moves to `ready` when the
+      smart-record callback reports the filename via `attach_clip`.
+    * `pending`   — `clip_service` will cut it from `media/camNN.mp4` (file sources).
+    * `skipped`   — no source timestamp, so the moment cannot be located in the video at all.
+      Recorded as skipped rather than left in the queue for a clip that can never be produced.
+    """
+    # Already carries its evidence. VLM escalations inherit the clip the hazard was seen in,
+    # which is both the most accurate footage available and the only one obtainable — nothing
+    # downstream can produce a clip for a synthetic event the pipeline never saw.
+    if ev.get("clip_uri"):
+        return "ready"
+    if ev.get("clip_mode") == "smart_record":
+        return "recording"
+    return "pending" if ev.get("source_pts_ns") is not None else "skipped"
 
 
 class EventStore:
@@ -230,6 +258,28 @@ class EventStore:
     def count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
+    def attach_clip(self, event_id: str, clip_uri: str) -> str:
+        """Record a finished smart-record clip against its incident.
+
+        Returns a short tag for logging, mirroring `apply()`.
+
+        A miss is NORMAL and is not an error. The pipeline emits one transition per track, but a
+        recording covers a MOMENT ON A CAMERA — several tracks starting together share one file,
+        and every one of them reports it. Meanwhile the store folds those transitions into a
+        single incident, so only the first has a row of its own; the rest legitimately match
+        nothing. The incident they merged into already carries the same file.
+
+        The guard on `clip_state` matters: without it a late callback would overwrite a clip an
+        operator may already have opened, and re-point an `expired` row at a file that retention
+        has since deleted.
+        """
+        cur = self.db.execute(
+            "UPDATE events SET clip_uri = ?, clip_state = 'ready', clip_error = NULL "
+            " WHERE event_id = ? AND clip_state IN ('recording', 'pending')",
+            (clip_uri, event_id))
+        self.db.commit()
+        return "clip-attached" if cur.rowcount else "clip-unmatched"
+
     # -- the state machine ------------------------------------------------------------------------
     def apply(self, ev: dict) -> str:
         """Apply one transition. Returns a short tag describing what happened, for logging."""
@@ -279,17 +329,15 @@ class EventStore:
             "INSERT OR IGNORE INTO events "
             "(event_id, ts, camera_id, type, severity, track_id, label, bbox, confidence, "
             " zone, clip_uri, vlm_verdict, vlm_reason, state, duration_s, open_tracks, "
-            " source_pts_ns, clip_state) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+            " source_pts_ns, clip_state, clip_mode) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
             (ev["event_id"], ev["ts"], ev["camera_id"], ev["type"], ev["severity"],
              ev.get("track_id"), ev.get("label"),
              json.dumps(ev["bbox"]) if ev.get("bbox") else None,
              ev.get("confidence"), ev.get("zone"), ev.get("clip_uri"),
              ev.get("vlm_verdict"), ev.get("vlm_reason"), ev.get("state", "new"),
              ev.get("duration_s"), ev.get("source_pts_ns"),
-             # An incident with no source timestamp cannot be located in the video, so mark it
-             # skipped rather than leaving it in the queue for a clip that can never be cut.
-             "pending" if ev.get("source_pts_ns") is not None else "skipped"))
+             _initial_clip_state(ev), ev.get("clip_mode")))
         self.db.execute(
             "INSERT OR REPLACE INTO incident_tracks VALUES (?,?,?,?)", (*key, ev["event_id"]))
         self.db.commit()

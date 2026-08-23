@@ -119,6 +119,15 @@ class Event:
     # is consuming it — verified at drop-frame-interval=2, where 5.2s of wall time advanced
     # buffer_pts by 10.3s of source.
     source_pts_ns: int | None = None
+    # How this incident's evidence clip will be produced. None/"ffmpeg" is the file-source path,
+    # where `clip_service` cuts the window out of media/camNN.mp4 with `ffmpeg -c copy`.
+    #
+    # "smart_record" is the RTSP path: there IS no local source file to cut from — the Jetson only
+    # ever sees the live stream — so `nvurisrcbin` dumps the clip out of its own ring buffer of the
+    # incoming ENCODED stream and the pipeline reports the filename afterwards. The store uses this
+    # to open the row as `clip_state='recording'` rather than `'pending'`, which is what keeps
+    # `clip_service` from picking up an incident whose source it could never find.
+    clip_mode: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -156,6 +165,22 @@ class EventEmitter:
         self._errors = 0
         self._last_connect_attempt = 0.0
         self._thread: threading.Thread | None = None
+        # Optional hook fired for every OPENING event, as `on_open(event)`. `SmartRecorder` uses
+        # it to cut an evidence clip in RTSP mode. It is set here rather than called from the
+        # transition detectors because every incident type — PPE, fire, overcrowding, VLM
+        # escalations — already funnels through emit(), so one interception point covers them
+        # all and no detector has to learn that clips exist. Fire alerts were once the only type
+        # missing their clip precisely because a parameter was threaded through two detectors
+        # out of three; a single choke point cannot drift that way.
+        #
+        # The whole Event is passed, not just (camera_id, event_id): the recorder has to treat a
+        # critical alert differently from a routine one, and a hook that hands over two fields
+        # forces every such decision back upstream into the caller.
+        self.on_open = None
+        # Stamped onto every outgoing Event so the store knows which clip backend owns this
+        # incident. Set once by the pipeline instead of at each of the ~six Event construction
+        # sites, which is how `source_pts_ns` came to be missing from fire alerts alone.
+        self.clip_mode = None
         if enabled:
             self._thread = threading.Thread(target=self._run, name="event-emitter", daemon=True)
             self._thread.start()
@@ -165,6 +190,17 @@ class EventEmitter:
         """Queue an event. Never blocks, never raises."""
         if not self.enabled:
             return
+        if self.clip_mode is not None and ev.clip_mode is None:
+            ev.clip_mode = self.clip_mode
+        if self.on_open is not None and not ev.ended:
+            # Runs on the GStreamer streaming thread, so the hook must return immediately —
+            # SmartRecorder.request() only puts on a queue. Swallow anything it raises: an
+            # exception escaping a probe becomes SIGABRT, not a traceback, and a missing clip
+            # must never be able to take down twenty camera streams.
+            try:
+                self.on_open(ev)
+            except Exception:  # noqa: BLE001
+                self._errors += 1
         try:
             self._q.put_nowait(ev)
         except queue.Full:
@@ -176,6 +212,24 @@ class EventEmitter:
                 self._q.put_nowait(ev)
             except (queue.Empty, queue.Full):
                 self._dropped += 1
+
+    def emit_raw(self, record: dict) -> None:
+        """Queue a non-Event record on the same stream. Never blocks, never raises.
+
+        Used for out-of-band facts the consumer must apply to an EXISTING incident rather than
+        fold into a new one — currently only `{"kind": "clip_ready", ...}` from the smart-record
+        callback. Riding the same stream (rather than a second one) means these inherit the
+        ordering, durability and consumer-group replay the events already have, and the consumer
+        stays a single loop.
+
+        Records without a `kind` are Events, which is what keeps this backward compatible.
+        """
+        if not self.enabled:
+            return
+        try:
+            self._q.put_nowait(record)
+        except queue.Full:
+            self._dropped += 1
 
     def stats(self) -> dict[str, int]:
         return {"published": self._published, "dropped": self._dropped,
@@ -230,14 +284,16 @@ class EventEmitter:
                 pass
             self._sock = None
 
-    def _publish(self, ev: Event) -> None:
+    def _publish(self, ev) -> None:
         if self._sock is None and not self._connect():
             self._dropped += 1
             return
+        # Event or plain dict (see emit_raw). Both go out as one JSON blob under `data`.
+        payload = ev.to_json() if isinstance(ev, Event) else json.dumps(ev, separators=(",", ":"))
         # MAXLEN ~ bounds the stream so a long-running demo cannot fill the disk. `~` is the
         # approximate form, which lets Redis trim on whole nodes and is markedly cheaper.
         cmd = _resp("XADD", self.stream, "MAXLEN", "~", str(self.maxlen), "*",
-                    "data", ev.to_json())
+                    "data", payload)
         try:
             self._sock.sendall(cmd)
             # The reply MUST be drained. Never reading it leaves replies accumulating in the

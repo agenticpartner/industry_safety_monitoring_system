@@ -19,6 +19,12 @@
 .env
 *.env.local
 
+# mediamtx generates a self-signed cert and PRIVATE KEY on first start (for its MoQ listener)
+# straight into the working directory. They are per-machine and regenerated on demand, so there
+# is nothing to keep — and a private key is the one file that must never reach a commit.
+auto.crt
+auto.key
+
 # --- generated media (hundreds of MB) ---
 # `media/*` not `media/`: excluding the directory itself makes the negation below unreachable,
 # because git never descends into an excluded directory.

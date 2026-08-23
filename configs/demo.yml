@@ -64,6 +64,42 @@ sources:
   rtsp_base: rtsp://CHANGE-ME-SOURCE-HOST:8554
   rtsp_pattern: cam%02d
 
+  # ---------------------------------------------------------------------------------------
+  # PRODUCTION: real cameras go here, one URL per camera, and these WIN over
+  # rtsp_base/rtsp_pattern above.
+  #
+  # A real fleet does not follow a printf pattern — every camera is its own device with its
+  # own host, credentials and vendor path. Position in this list IS the camera id: the first
+  # entry is camera 1, which is what `analytics/zones.yml`, the OSD ("CAM 01"), the clip
+  # prefixes and the dashboard all key on. Reordering it renames every camera.
+  #
+  # Credentials in a URL are credentials in a committed file. For anything real, put the URLs
+  # in .env and reference them, or keep this file out of the repo — see the note on .env in
+  # README.md.
+  #
+  #   rtsp_urls:
+  #     - rtsp://user:pw@10.0.0.11/Streaming/Channels/101      # Hikvision
+  #     - rtsp://user:pw@10.0.0.12/axis-media/media.amp        # Axis
+  #     - rtsp://10.0.0.13:554/cam/realmonitor?channel=1&subtype=0   # Dahua
+  rtsp_urls: []
+
+  # Live-source resilience. Applied to every RTSP source; ignored in file mode.
+  rtsp:
+    # Reconnect when no data has arrived for this long. THE ELEMENT DEFAULT IS 0 = NEVER, which
+    # means one network blip retires that camera for the life of the pipeline — its tile goes
+    # black and the only trace is a single "Could not read from resource". Measured here: 3 of
+    # 20 streams lost this way on a quiet LAN in a normal run.
+    reconnect_interval_s: 10
+    # Same, for the FIRST connection: a camera still booting, or a demo started before its
+    # source server, is retried rather than abandoned.
+    init_reconnect_interval_s: 10
+    reconnect_attempts: -1        # -1 = keep trying forever
+    # tcp | udp | udp-mcast | auto. TCP by default: twenty 1080p streams is enough traffic that
+    # UDP loss surfaces as read failures. `auto` restores the element's udp-first behaviour.
+    transport: tcp
+    # Jitterbuffer. 100ms (the element default) is tight for anything crossing a real network.
+    latency_ms: 200
+
 inference:
   ppe:
     config: configs/pgie_ppe.yml

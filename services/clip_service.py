@@ -161,6 +161,64 @@ class ClipCutter:
         return out, None
 
 
+def reclaim_stuck_recordings(db: sqlite3.Connection, older_than_s: float) -> int:
+    """Fail incidents left in `recording` long past when their clip should have landed.
+
+    `recording` means the PIPELINE owns this clip (smart record, RTSP sources) and this service
+    must keep its hands off. But that hand-off has no delivery guarantee: if the pipeline is
+    killed mid-recording, or the completion callback never fires, the row sits in `recording`
+    forever — and because the reasoning service only considers `clip_state='ready'`, the incident
+    would also never be adjudicated. Silently stuck in two layers at once.
+
+    So the state is bounded. The window is generous (the clip itself takes pre+post seconds to
+    record before the callback can even fire) and the row is marked `failed` with a reason rather
+    than retried, because this service cannot produce the clip — only say that it never arrived.
+    """
+    cutoff = time.time() - older_than_s
+    cur = db.execute(
+        "UPDATE events SET clip_state = 'failed', "
+        "       clip_error = 'smart-record clip never reported by the pipeline' "
+        " WHERE clip_state = 'recording' AND ts < ?", (cutoff,))
+    # Commit UNCONDITIONALLY, even at zero rows. Python's sqlite3 opens a transaction on any DML
+    # and holds a RESERVED lock until commit, so `if cur.rowcount: commit()` leaves an empty
+    # write transaction open for the life of the process — and this sweep matches nothing on
+    # almost every pass. Every other writer then dies with "database is locked": observed here
+    # as the event service retrying forever and the reasoning service failing at startup, with
+    # zero incidents reaching the store while the pipeline ran perfectly.
+    db.commit()
+    return cur.rowcount
+
+
+def reap_orphan_clips(clips_dir: Path, db: sqlite3.Connection, grace_s: float = 120.0) -> int:
+    """Delete smart-record clips that no incident ever claimed.
+
+    The pipeline triggers a recording per opening TRANSITION, but the store folds transitions
+    into incidents — so a camera with an ongoing violation keeps producing transitions that merge
+    into an incident which already has its clip, and the resulting files are claimed by nobody.
+    Measured on a 210 s, 20-camera run: 99 clips written, 31 linked, 68 orphans at ~9 MB each.
+    Left alone that is ~600 MB per 3.5 minutes, and because `gc()` evicts strictly oldest-first
+    it would start deleting REAL evidence to make room for garbage.
+
+    The pipeline cannot avoid producing these — merging is the store's knowledge, not the
+    pipeline's, and the recording has to start before anyone knows whether the incident is new.
+    So they are cleaned up here, where disk is already owned.
+
+    `grace_s` must comfortably exceed the clip_ready round trip (callback -> Redis ->
+    event_service -> UPDATE); a clip deleted while its own attachment is still in flight would
+    leave an incident pointing at a file that no longer exists.
+    """
+    linked = {Path(r[0]).name for r in
+              db.execute("SELECT clip_uri FROM events WHERE clip_uri IS NOT NULL")}
+    cutoff = time.time() - grace_s
+    removed = 0
+    for p in clips_dir.glob("*.mp4"):
+        if p.name in linked or p.stat().st_mtime > cutoff:
+            continue
+        p.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 def gc(clips_dir: Path, db: sqlite3.Connection, budget_mb: int, retention_days: int) -> int:
     """Enforce the disk budget. Oldest clips go first; the DB row keeps the incident.
 
@@ -262,6 +320,19 @@ def main() -> int:
                       f"cam{camera_id:02d}", flush=True)
         if rows:
             db.commit()
+
+        # Generous: the recording itself runs pre+post seconds before its callback can fire, and
+        # a burst of incidents queues behind one another on the same camera.
+        stuck = reclaim_stuck_recordings(db, max(120.0, (pre + post) * 6))
+        if stuck:
+            print(f"[clip-service] {stuck} incident(s) stuck in 'recording' marked failed",
+                  flush=True)
+
+        # Reap BEFORE the budget sweep: `gc()` evicts oldest-first regardless of whether a clip
+        # is real evidence, so unclaimed files must go first or they push genuine ones out.
+        orphans = reap_orphan_clips(clips_dir, db)
+        if orphans:
+            print(f"[clip-service] reaped {orphans} unclaimed smart-record clip(s)", flush=True)
 
         removed = gc(clips_dir, db, budget, retention)
         if removed:

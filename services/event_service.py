@@ -142,7 +142,15 @@ def main() -> int:
         for _stream_name, entries in resp:
             for entry_id, fields in entries:
                 try:
-                    what = store.apply(json.loads(fields["data"]))
+                    rec = json.loads(fields["data"])
+                    # Records carrying a `kind` are out-of-band facts about an EXISTING incident
+                    # rather than transitions to fold into one. Only smart record uses this so
+                    # far, to report the evidence clip it just finished writing. Events have no
+                    # `kind`, which is what keeps the common path untouched.
+                    if rec.get("kind") == "clip_ready":
+                        what = store.attach_clip(rec["event_id"], rec["clip_uri"])
+                    else:
+                        what = store.apply(rec)
                     counts[what] = counts.get(what, 0) + 1
                 except sqlite3.OperationalError as e:
                     # TRANSIENT — a lock or a busy database. This is NOT a malformed entry and
