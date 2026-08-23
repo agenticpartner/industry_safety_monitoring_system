@@ -92,7 +92,22 @@ EOF
     # -re paces at real time so it behaves like a 30fps camera rather than a firehose.
     # -c copy keeps the existing H.265 elementary stream: no re-encode, so this machine can
     # comfortably push 20 streams without becoming the bottleneck.
-    nohup ffmpeg -hide_banner -loglevel error -stream_loop -1 -re -i "$f" \
+    #
+    # -fflags +genpts is NOT optional, and it is not a codec detail. `-stream_loop -1` restarts
+    # the file's timestamps at every loop, and the resulting discontinuity reaches the Jetson as
+    # a glitched frame — DeepStream says so out loud ("Invalid PTS found in stream"). A smeared
+    # block of warm pixels is exactly what a fire/smoke detector is looking for, so a real
+    # camera farm that loops a 40s clip invents fire on innocent cameras every 40 seconds.
+    #
+    # Measured on cam14/cam16, same footage, three ways:
+    #   file mode                          0 fire/smoke detections
+    #   RTSP, no loop boundary             0
+    #   RTSP, -stream_loop, no genpts      4 false fire incidents in 12 min, 27 PTS warnings
+    #   RTSP, -stream_loop, WITH genpts    0, and 0 PTS warnings
+    #
+    # The same discontinuity also inflated smart-record clips from the requested 12s to 38-40s.
+    # Regenerating timestamps at the loop point costs nothing and removes both.
+    nohup ffmpeg -hide_banner -loglevel error -fflags +genpts -stream_loop -1 -re -i "$f" \
       -an -c:v copy -f rtsp -rtsp_transport tcp \
       "rtsp://127.0.0.1:${PORT}/$(printf 'cam%02d' "$i")" >/dev/null 2>&1 &
     echo $! >> "$PIDS"
