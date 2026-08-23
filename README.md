@@ -69,28 +69,21 @@ production, size at **16 cameras per Orin** (1.30× headroom).
 
 ### On live RTSP cameras
 
-The table above is **file mode**, run flat out — that is what measures a ceiling. Live sources
-are paced by the cameras, so throughput can never exceed realtime and the question becomes
-whether the box keeps up. Measured on 20 cameras over the LAN:
+The figures above are file mode, run flat out — a ceiling. Live cameras pace the pipeline, so the
+question is whether it keeps up. Measured on 20 cameras over the LAN:
 
 | | |
 |---|---|
 | Detection → visible on the dashboard | **0.12 s** median (0.19 s p90) |
-| Detection → evidence clip ready | 11.1 s median — smart record must *record* the window |
-| VLM verdict | 22.9 s median · **6.7 s** of that is inference, the rest is the clip + queue |
-| Jetson capacity, same configuration | **484.6 fps** against a 300 fps requirement — **1.6×** |
+| Detection → evidence clip ready | 11.1 s median |
+| VLM verdict | 22.9 s median, of which 6.7 s is inference |
+| Capacity, same configuration | **484.6 fps** against 300 needed — **1.6×** |
 | GPU, steady state | ~30% |
 
-**It is realtime, with 1.6× headroom.** The analytics rate observed on the demo rig is ~190 fps
-rather than the ~290 fps the cameras deliver, and that gap is **ingest, not compute** — with 70%
-of the GPU idle the pipeline cannot be the constraint. Twenty concurrent TCP RTSP streams arrive
-from one host over one NIC, and `nvstreammux` in `live-source` mode batches on a 40 ms timeout
-without waiting for stragglers, so jittered frames miss their batch. Real cameras are separate
-devices with their own uplinks. Treat ~190 fps as a property of the rig, not of the Jetson.
-
-Evidence clips are slower over RTSP and that is inherent rather than a regression: a file source
-is already on disk and can be cut immediately, while a live camera has to be recorded — the clip
-cannot exist until `pre_roll + post_roll` has physically elapsed.
+**Realtime, with 1.6× headroom.** The rig itself feeds ~190 fps rather than the ~290 the cameras
+send — that is ingest, not compute (70% of the GPU is idle). Twenty TCP streams from one host
+over one NIC, and `nvstreammux` drops frames that miss its 40 ms batch window. Real cameras are
+separate devices; don't read ~190 fps as a Jetson limit.
 
 ---
 
@@ -295,10 +288,7 @@ arrive as transitions and the adjudicator keeps up easily.
 
 ### Real cameras instead of files
 
-Set `pipeline.source_mode: rtsp` and list your cameras in `sources.rtsp_urls` — one URL per
-camera. **Position in the list is the camera id**, which is what `analytics/zones.yml`, the OSD
-("CAM 01"), the clip prefixes and the dashboard all key on, so reordering it renames every
-camera.
+Set `pipeline.source_mode: rtsp` and list the cameras:
 
 ```yaml
 sources:
@@ -308,54 +298,41 @@ sources:
     - rtsp://10.0.0.13:554/cam/realmonitor?channel=1&subtype=0   # Dahua
 ```
 
-Credentials in a URL are credentials in a committed file — for anything real, keep `demo.yml`
-out of the repo or move the URLs into `.env`. Leave `rtsp_urls` empty to fall back to the demo's
-`rtsp_base` + `rtsp_pattern`, which assumes numbered mounts on one server.
+- **List position is the camera id** — zones, the OSD and clip names all key on it. Reordering
+  renames every camera.
+- Credentials in a URL end up in git. Keep `demo.yml` out of the repo, or move them to `.env`.
+- Leave `rtsp_urls` empty to fall back to `rtsp_base` + `rtsp_pattern` (the demo's numbered
+  mounts).
+- `sources.rtsp` sets reconnect, TCP and a 200 ms jitterbuffer. Keep reconnect on:
+  `nvurisrcbin` defaults it to *never*, so one blip blacks out that camera until restart.
 
-**Reconnection is on by default and matters more than it looks.** `nvurisrcbin`'s
-`rtsp-reconnect-interval` ships as `0`, meaning *never*: one network blip retires that camera for
-the life of the pipeline — its tile goes black and the only trace is a single "Could not read
-from resource" in the log. Observed on 3 of 20 streams during an ordinary run on a quiet LAN.
-`sources.rtsp` sets reconnect, retry-forever, TCP transport and a 200 ms jitterbuffer.
-
-If you want to *simulate* cameras, run the source server **on a different machine** — never on
-the Jetson. Production cameras are separate network devices; generating 20 streams on the box
-that is also running inference burns CPU alongside it and misrepresents the load.
+To simulate cameras, run the server **on another machine** — never the Jetson, or you measure
+your own CPU:
 
 ```bash
-# on a laptop or spare box on the same LAN (macOS or Linux)
-./scripts/serve_rtsp_sources.sh start 20
-# it prints the exact rtsp_base line to paste into configs/demo.yml
+./scripts/serve_rtsp_sources.sh start 20   # prints the rtsp_base line to paste in
 ```
 
-One caveat about that simulator, because it produces symptoms that look like product bugs:
-looping a *compressed* stream with `-c copy` restarts the GOP without re-sending parameter sets,
-so the Jetson's decoder loses reference frames. That shows up as occasional fire/smoke detections
-on cameras with no fire in them. The media itself is fine — decoding the same file from disk
-gives zero errors, and file-mode runs over that footage detect no fire at all. Real cameras
-encode natively for RTSP and do not restart a GOP mid-session.
+Note it loops a compressed stream, which restarts the GOP and occasionally makes the fire
+detector fire on decode smear. Artifact of the simulator, not the detector — the same footage in
+file mode detects nothing.
 
-### Evidence clips and subject crops over RTSP
+### Evidence over RTSP
 
-Over RTSP the Jetson never has the source file, only the live stream, so both are captured from
-the pipeline itself:
+There is no local source file, so both come off the pipeline:
 
-* **Clips** come from `nvurisrcbin` smart record, which dumps `pre_roll + post_roll` out of its
-  ring buffer of the incoming encoded stream — full source frame rate regardless of the analytics
-  rate, no re-encode.
-* **Subject crops** for PPE adjudication are taken *in the probe*, at the instant of detection,
-  from a valve-gated RGB branch that costs nothing while idle (measured: 484.6 → 481.3 fps at 20
-  streams). This needs torch, which lives in `build/venv-pipeline`, a
-  `--system-site-packages` venv so system Python stays untouched:
+- **Clips** — `nvurisrcbin` smart record, straight from its ring buffer. Full source frame rate,
+  no re-encode. Slower to appear than file mode (11 s vs 2 s) because the window has to elapse.
+- **Subject crops** — captured in the probe at the moment of detection, behind a valve that
+  costs nothing when idle (484.6 → 481.3 fps at 20 streams). Needs torch:
 
 ```bash
-python3 -m venv --system-site-packages build/venv-pipeline
+python3 -m venv --system-site-packages build/venv-pipeline   # sees system pyservicemaker
 build/venv-pipeline/bin/pip install torch
 build/venv-pipeline/bin/python3 app/safety_pipeline.py --source rtsp --rgb-capture ...
 ```
 
-Without `--rgb-capture` the reasoning service falls back to context frames sampled across the
-clip, which is weaker but needs no extra dependency.
+Without `--rgb-capture` the VLM falls back to context frames — weaker, but no extra dependency.
 
 ---
 
