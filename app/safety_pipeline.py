@@ -1105,6 +1105,52 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
 
     probe_point = head  # last element that still carries one frame_meta PER STREAM
 
+    # ---- frame-capture branch (optional) -----------------------------------------------------
+    # To crop the violating subject out of the live frame we need the PIXELS, and
+    # `Buffer.extract()` will only hand back a tensor for an RGB surface in NVMM. The main path
+    # cannot simply be converted: `nvdsosd` accepts NV12 or RGBA and nothing else, so an RGB main
+    # path breaks rendering outright.
+    #
+    # Hence a tee. The capture branch sits behind a `valve` that DROPS by default, so when no
+    # incident is pending the branch costs a tee and a closed gate — the convert never runs. The
+    # probe opens it for a moment when it needs a frame, which makes the captured frame about one
+    # frame later than the detection rather than exact. At 15 fps analytics that is ~66 ms, which
+    # is a different order of error entirely from the clip-crop attempt this replaces (that one
+    # could not find the subject at ANY offset, because a stored bbox and a smart-record clip
+    # describe different moments by construction).
+    if args.rgb_capture:
+        p.add("tee", "cap_tee")
+        p.link(head, "cap_tee")
+        p.add("queue", "q_cap", {"leaky": 2, "max-size-buffers": 1,
+                                 "max-size-bytes": 0, "max-size-time": 0})
+        # drop-mode=1 (forward-sticky-events) so caps and segment still reach the convert while
+        # the gate is shut; with the default drop-all the branch has no caps to renegotiate from
+        # when it opens.
+        p.add("valve", "cap_valve", {"drop": True, "drop-mode": 1})
+        # compute-hw=1 (GPU) is REQUIRED, not a tuning preference. Jetson's nvvideoconvert
+        # defaults to VIC, which cannot produce RGB from NV12: the branch builds and links fine
+        # and then every buffer dies with "buffer transform failed" the moment the valve opens.
+        # Cost nothing to diagnose only because the valve made it look like a valve problem.
+        p.add("nvvideoconvert", "cap_conv", {"compute-hw": 1})
+        p.add("capsfilter", "cap_caps",
+              {"caps": "video/x-raw(memory:NVMM), format=RGB"})
+        # async=0: there is a tee in the graph, and a sink left on async=1 parks the whole
+        # pipeline in PAUSED with no video and no error (trap 8).
+        p.add("fakesink", "cap_sink", {"sync": 0, "qos": 0, "async": 0})
+        p.link(("cap_tee", "q_cap"), ("src_%u", ""))
+        p.link("q_cap", "cap_valve", "cap_conv", "cap_caps", "cap_sink")
+        head = "cap_tee"
+        print("[capture] RGB frame-capture branch added (valve closed until a crop is needed)",
+              flush=True)
+
+    def _link_downstream(first_q: str, *rest: str) -> None:
+        """Link the rendering chain, taking a request pad when the capture tee is in the way."""
+        if args.rgb_capture:
+            p.link(("cap_tee", first_q), ("src_%u", ""))
+            p.link(first_q, *rest)
+        else:
+            p.link(head, first_q, *rest)
+
     # ---- tiler + osd ----
     if args.no_osd:
         # Diagnostic: straight from inference to a fakesink. Everything between here and the
@@ -1143,15 +1189,15 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
         p.add("nvvideoconvert", "osd_conv", {"compute-hw": compute_hw})
         p.add("capsfilter", "osd_caps", {"caps": "video/x-raw(memory:NVMM), format=RGBA"})
         p.add("nvdsosd", "osd", {"process-mode": 1})
-        p.link(head, _q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_conv"),
-               "osd_conv", "osd_caps", "osd")
+        _link_downstream(_q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_conv"),
+                         "osd_conv", "osd_caps", "osd")
     elif render.get("osd", True):
         p.add("nvdsosd", "osd", {"process-mode": 1})
-        p.link(head, _q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_osd"), "osd")
+        _link_downstream(_q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_osd"), "osd")
     else:
         # Diagnostic only: tiler with no OSD, to separate compositing cost from draw cost.
         p.add("identity", "osd", {"silent": 1})
-        p.link(head, _q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_osd"), "osd")
+        _link_downstream(_q(p, "q_pre_tile"), "tiler", _q(p, "q_pre_osd"), "osd")
 
     # ---- sinks ----
     want_display = cfg["sinks"]["display"].get("enabled", True) and not args.no_display
@@ -1293,6 +1339,10 @@ def main() -> int:
                          "comparable to Phase 1")
     ap.add_argument("--no-events", action="store_true",
                     help="force events off even if services.yml enables them")
+    ap.add_argument("--rgb-capture", action="store_true",
+                    help="add the valve-gated RGB tee branch used to crop the violating subject "
+                         "out of the live frame. Off by default until its cost at full stream "
+                         "count is measured")
     ap.add_argument("--no-smart-record", action="store_true",
                     help="disable nvurisrcbin smart-record evidence clips in rtsp mode. Clips "
                          "are the only way to get evidence video off a live camera, so this is "
