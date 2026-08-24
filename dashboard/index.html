@@ -991,7 +991,7 @@ async function refreshKpis(){
 }
 async function refreshSystem(){
   const m = await get("/metrics/system?minutes=5&max_points=240");
-  if(m.error){ $("#sys-chart").innerHTML = `<p class="muted">tegrastats: ${m.error}</p>`; return; }
+  if(m.error){ $("#sys-chart").innerHTML = `<p class="muted">${m.backend||"metrics"}: ${m.error}</p>`; return; }
   $("#sys-legend").innerHTML = SERIES.map(s=>`<span><i class="sw" style="background:var(${s.v})"></i>${s.label}</span>`).join("");
   lineChart($("#sys-chart"), m.history, SERIES);
   const c = m.current||{};

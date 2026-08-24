@@ -866,6 +866,10 @@ def metrics_system(minutes: float = Query(5.0, ge=0.1, le=60),
         "history": SAMPLER.history(minutes, max_points),
         "interval_ms": SAMPLER.interval_ms,
         "samples_buffered": len(SAMPLER.buf),
+        # Which telemetry produced these: "tegrastats" on Jetson, "nvidia-smi" on a discrete GPU.
+        # The dashboard names it when reporting an error, so a failure reads as the tool that
+        # actually failed rather than as whichever one this file was written against.
+        "backend": SAMPLER.backend,
         "error": SAMPLER.error,
     }
 
