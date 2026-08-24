@@ -81,6 +81,33 @@ def is_jetson() -> bool:
     return os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
 
 
+def device_label() -> tuple[str, str]:
+    """(platform, human-readable device) — what the dashboard puts on screen.
+
+    The board string on Tegra and the GPU name on a discrete card. Read once: neither changes
+    while the process is alive, and nvidia-smi is a process launch.
+    """
+    if is_jetson():
+        try:
+            with open("/proc/device-tree/model", "rb") as fh:
+                model = fh.read().decode("utf-8", "replace").replace("\x00", "").strip()
+            if model:
+                return "jetson", model
+        except OSError:
+            pass
+        return "jetson", "NVIDIA Jetson"
+
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10)
+        name = (out.stdout or "").strip().splitlines()
+        if name and name[0].strip():
+            return "dgpu", name[0].strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "dgpu", "discrete NVIDIA GPU"
+
+
 def parse(line: str) -> dict | None:
     """One tegrastats line -> a flat sample. Returns None for lines that are not samples."""
     m_ram = RE_RAM.search(line)
@@ -195,6 +222,8 @@ class _BaseSampler:
         self._stop = threading.Event()
         self.error: str | None = None
         self.backend = "none"
+        self.platform, self.device = device_label()
+        self.arch = os.uname().machine
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

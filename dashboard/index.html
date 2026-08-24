@@ -441,7 +441,8 @@
       </div>
 
       <div class="card">
-        <h2>System utilisation <span class="muted">· last 5 min · 2s</span></h2>
+        <h2>System utilisation <span class="muted">· last 5 min · 2s</span>
+            <span class="tag" id="sys-platform" hidden></span></h2>
         <div class="legend" id="sys-legend"></div>
         <div id="sys-chart"></div>
         <details><summary>Table view</summary><div id="sys-table"></div></details>
@@ -992,12 +993,25 @@ async function refreshKpis(){
 async function refreshSystem(){
   const m = await get("/metrics/system?minutes=5&max_points=240");
   if(m.error){ $("#sys-chart").innerHTML = `<p class="muted">${m.backend||"metrics"}: ${m.error}</p>`; return; }
+  // Which machine this is. The same UI now serves a Jetson and an x86 box and the numbers alone
+  // do not say which, so the platform is named rather than inferred from a missing series.
+  const plat = $("#sys-platform");
+  if(m.device){
+    plat.textContent = (m.platform === "jetson" ? "Jetson" : "x86") + " · " + m.device;
+    plat.hidden = false;
+  }
+  // `ram` is the memory the GPU draws from: the unified pool on Jetson, VRAM on a discrete card.
+  // Same question, different name, so the legend follows the platform rather than picking one.
+  const ramSeries = SERIES.find(x => x.key === "ram");
+  if(ramSeries) ramSeries.label = (m.platform === "jetson") ? "RAM" : "VRAM";
   $("#sys-legend").innerHTML = SERIES.map(s=>`<span><i class="sw" style="background:var(${s.v})"></i>${s.label}</span>`).join("");
   lineChart($("#sys-chart"), m.history, SERIES);
   const c = m.current||{};
   $("#sys-table").innerHTML = `<table><tr><th>metric</th><th>now</th></tr>` +
     SERIES.map(s=>`<tr><td>${s.label}</td><td>${fmt(c[s.key])}%</td></tr>`).join("") +
-    `<tr><td>RAM used</td><td>${fmt(c.ram_used_mb)} / ${fmt(c.ram_total_mb)} MB</td></tr>
+    `<tr><td>Platform</td><td>${m.arch || "?"} · ${m.device || "?"}</td></tr>
+     <tr><td>Telemetry</td><td>${m.backend || "?"}</td></tr>
+     <tr><td>${m.platform === "jetson" ? "RAM used" : "VRAM used"}</td><td>${fmt(c.ram_used_mb)} / ${fmt(c.ram_total_mb)} MB</td></tr>
      <tr><td>Temp (tj)</td><td>${fmt(c.temp_tj)} °C</td></tr>
      <tr><td>Power</td><td>${fmt(c.power_mw)} mW</td></tr></table>`;
 }
