@@ -8,6 +8,7 @@
 # services/reasoning_service.py nor services/agent.py ever learns what is behind it.
 #
 #   HF_TOKEN         optional; only needed if a repo is gated
+#   LLAMA_HOST       bind address, default 127.0.0.1
 #   WEIGHTS_DIR      where the GGUFs live (a volume, so a 12 GB pull happens once)
 #   LLAMA_CTX_SIZE   context window, default 8192
 #   LLAMA_NGL        layers on GPU, default 99 (all)
@@ -17,6 +18,10 @@ ROLE="${ROLE:-vlm}"
 WEIGHTS_DIR="${WEIGHTS_DIR:-/weights}"
 CTX="${LLAMA_CTX_SIZE:-8192}"
 NGL="${LLAMA_NGL:-99}"
+# Loopback by default. These containers use host networking, so 0.0.0.0 publishes an unauthenticated
+# model server on whatever public address the machine has. Only the app talks to them, and it is in
+# the same network namespace.
+HOST="${LLAMA_HOST:-127.0.0.1}"
 
 die() { printf "\033[31mERROR: %s\033[0m\n" "$1" >&2; exit 1; }
 step() { printf "\n\033[1m==> %s\033[0m\n" "$1"; }
@@ -77,7 +82,7 @@ case "$ROLE" in
     step "serving ${ALIAS} on :${PORT}"
     exec llama-server \
         --model "$WEIGHTS" --mmproj "$MMPROJ" \
-        --host 0.0.0.0 --port "$PORT" \
+        --host "$HOST" --port "$PORT" \
         -ngl "$NGL" --ctx-size "$CTX" --parallel 1 --no-warmup \
         --image-min-tokens "${IMAGE_MIN_TOKENS:-1024}" \
         --alias "$ALIAS"
@@ -101,7 +106,7 @@ case "$ROLE" in
     step "serving ${ALIAS} on :${PORT}"
     exec llama-server \
         --model "${DIR}/${FILE}" \
-        --host 0.0.0.0 --port "$PORT" \
+        --host "$HOST" --port "$PORT" \
         -ngl "$NGL" --ctx-size "$CTX" --parallel 1 --no-warmup \
         --alias "$ALIAS"
     ;;

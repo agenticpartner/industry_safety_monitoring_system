@@ -44,7 +44,9 @@ rtspAddress: :${PORT}
 # but have completely different fixes. Without it the only honest thing the UI could say is
 # "no video", which tells an operator nothing.
 api: yes
-apiAddress: :9997
+# Loopback: only services/api.py reads it, from this same host. The RTSP/WebRTC/HLS listeners
+# below stay on all interfaces because a remote browser is the entire point of them.
+apiAddress: 127.0.0.1:9997
 
 webrtc: yes
 webrtcAddress: :8889

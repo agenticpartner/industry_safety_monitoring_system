@@ -23,7 +23,13 @@ services:
     # The event bus between the pipeline and the services. Persistence is off on purpose: the
     # stream is bounded to 100k entries (services.yml) and SQLite is the durable store — an RDB
     # dump would duplicate it and stall the writer at exactly the wrong moment.
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    #
+    # `--bind 127.0.0.1` is not optional. With host networking there is one port space and it is
+    # the machine's, so a default-bound redis on a cloud instance is an unauthenticated redis on a
+    # public IP — verified answering PING from the open internet on this very deployment. That is
+    # a known, automated attack path: CONFIG SET dir/dbfilename turns it into arbitrary file write
+    # as the redis user. Nothing outside this host has any reason to reach the event bus.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--bind", "127.0.0.1"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -99,6 +105,8 @@ services:
     environment:
       ROLE: vlm
       PORT: "8000"
+      # Loopback: only the app container, which shares this host's network namespace, calls it.
+      LLAMA_HOST: "${LLAMA_HOST:-127.0.0.1}"
       # Only needed if a weights repo is gated. Read from docker/.env or the shell.
       HF_TOKEN: "${HF_TOKEN:-}"
       LLAMA_CTX_SIZE: "${VLM_CTX_SIZE:-8192}"
@@ -125,6 +133,8 @@ services:
     environment:
       ROLE: llm
       PORT: "8001"
+      # Loopback: only the app container, which shares this host's network namespace, calls it.
+      LLAMA_HOST: "${LLAMA_HOST:-127.0.0.1}"
       HF_TOKEN: "${HF_TOKEN:-}"
       LLAMA_CTX_SIZE: "${LLM_CTX_SIZE:-8192}"
     volumes:
@@ -163,6 +173,8 @@ services:
     restart: unless-stopped
     environment:
       RTSP_PORT: "8654"
+      # Same box as the pipeline, so there is nothing off-host to serve.
+      RTSP_BIND: "127.0.0.1"
     volumes:
       - ../media:/opt/isms/media:ro
     # The script backgrounds mediamtx and the restreamers and returns; the tail is what gives the
