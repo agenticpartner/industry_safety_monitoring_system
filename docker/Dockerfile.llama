@@ -1,0 +1,83 @@
+# llama.cpp server for the reasoning layer, as its own image.
+#
+# One image, two roles. The VLM (Cosmos Reason 2) adjudicates incidents on :8000; the agent LLM
+# (Nemotron Nano 9B) answers human questions on :8001. Same binary, different weights and flags —
+# they are separate containers because they have very different duty cycles, and restarting one
+# must never disturb the other. That is the same split scripts/setup_reasoning.sh makes on the
+# Jetson, for the same reason.
+#
+# Separate from the DeepStream image because building this needs a full CUDA toolchain, ~6 GB
+# that has no business in a runtime image, and because the reasoning layer is optional: a
+# deployment that only wants the vision path never pulls this.
+
+# =================================================================================================
+# Stage 1 — compile llama.cpp against CUDA
+# =================================================================================================
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS build
+
+# Which GPUs the binary can run on. The default spans the datacenter cards this is likely to meet
+# — 80 A100, 86 A10/A10G, 89 L4/L40S/RTX-40, 90 H100 — because an image built for one instance
+# type that dies on the next is not a deployable artifact. Every arch costs compile time, so a
+# build pinned to a known target passes a single value:
+#
+#     --build-arg CUDA_ARCHS=89
+#
+# Getting this wrong does not fail the build. It produces a binary whose every kernel launch
+# fails at runtime, which is why it is explicit rather than left to llama.cpp's own default.
+ARG CUDA_ARCHS="80;86;89;90"
+ARG LLAMA_REF=master
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake build-essential libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${LLAMA_REF}" https://github.com/ggml-org/llama.cpp /src
+
+# BUILD_SHARED_LIBS=OFF so llama-server is a single binary to carry into the runtime stage
+# instead of a binary plus a set of ggml .so files that have to be found again at load time.
+RUN cmake -S /src -B /src/build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+    && cmake --build /src/build --config Release -j "$(nproc)" --target llama-server \
+    && test -x /src/build/bin/llama-server
+
+# There is deliberately no `llama-server --version` check here or in the runtime stage. libcuda.so.1
+# is the DRIVER library, injected by the container toolkit at run time and absent from every build,
+# so a CUDA-enabled binary cannot start during `docker build` — it exits on a missing .so. A check
+# written that way passes only when the pipe hides the exit code, which is worse than no check.
+# `llama-server --list-devices` under `--gpus all` is where this gets verified.
+
+
+# =================================================================================================
+# Stage 2 — runtime
+# =================================================================================================
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    WEIGHTS_DIR=/weights \
+    PYTHONUNBUFFERED=1
+
+# huggingface_hub rather than curl for the weight pull: these are 5-7 GB files over a link that
+# will drop at least once, and hf_hub_download resumes. curl would restart from zero.
+# Full python3, not python3-minimal — huggingface_hub reaches well past what minimal ships.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libcurl4 ca-certificates curl python3 python3-pip \
+    && pip install --no-cache-dir --break-system-packages "huggingface_hub>=0.25" \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c "from huggingface_hub import hf_hub_download" 
+
+COPY --from=build /src/build/bin/llama-server /usr/local/bin/llama-server
+
+COPY docker/entrypoint-llama.sh /usr/local/bin/entrypoint-llama.sh
+RUN chmod +x /usr/local/bin/entrypoint-llama.sh \
+    && test -x /usr/local/bin/llama-server
+
+# 8000 VLM · 8001 agent LLM
+EXPOSE 8000 8001
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-llama.sh"]

@@ -14,6 +14,7 @@
 #   ISMS_AUTOSTART=1       start the pipeline on boot, not just the API
 #   ISMS_WIPE=1            wipe previous incidents and clips first
 #   ISMS_ENGINE_BATCH=20   TensorRT engine batch. Must match `batch-size` in the nvinfer configs.
+#   ISMS_WAIT_VLM_S=2400   how long to keep watching for the VLM in the background. 0 disables.
 set -uo pipefail
 cd "${ISMS_ROOT:-/opt/isms}"
 ROOT="$(pwd)"
@@ -23,6 +24,7 @@ SOURCE="${ISMS_SOURCE:-file}"
 AUTOSTART="${ISMS_AUTOSTART:-1}"
 WIPE="${ISMS_WIPE:-1}"
 BATCH="${ISMS_ENGINE_BATCH:-20}"
+WAIT_VLM_S="${ISMS_WAIT_VLM_S:-0}"
 
 step() { printf "\n\033[1m==> %s\033[0m\n" "$1"; }
 die()  { printf "\033[31mERROR: %s\033[0m\n" "$1" >&2; exit 1; }
@@ -100,6 +102,30 @@ ensure_engines() {
 }
 
 # -------------------------------------------------------------------------------------------
+# The reasoning layer runs in its own containers and is slow to arrive: ~12 GB of weights on a
+# first boot, then minutes to load. run_services.sh checks for a VLM endpoint ONCE and skips the
+# reasoning service if it is not there yet, which on a cold `compose up` it never is.
+#
+# So the wait happens here, in the background, and the vision path does not participate in it.
+# The dashboard and the pipeline come up immediately; the reasoning service joins when the VLM
+# answers. Until then incidents stay `unverified` — the documented degraded mode.
+join_reasoning_when_ready() {
+  local endpoint deadline
+  [ "${WAIT_VLM_S:-0}" -gt 0 ] 2>/dev/null || return 0
+  endpoint="$(python3 -c "import yaml;print(yaml.safe_load(open('configs/services.yml'))['reasoning']['endpoint'])" 2>/dev/null)" || return 0
+  deadline=$(( $(date +%s) + WAIT_VLM_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -sf --max-time 3 "${endpoint}/models" >/dev/null 2>&1; then
+      echo "[reasoning] VLM answered at ${endpoint} — starting the reasoning service"
+      bash scripts/run_services.sh reasoning
+      return 0
+    fi
+    sleep 15
+  done
+  echo "[reasoning] no VLM at ${endpoint} after ${WAIT_VLM_S}s — running vision-only"
+}
+
+# -------------------------------------------------------------------------------------------
 wait_for_redis() {
   local host port n
   host="$(python3 -c "import yaml;print(yaml.safe_load(open('configs/services.yml'))['events']['redis']['host'])" 2>/dev/null || echo 127.0.0.1)"
@@ -152,6 +178,11 @@ case "${1:-serve}" in
       bash scripts/run_services.sh reset || die "services failed to start"
     else
       bash scripts/run_services.sh start || die "services failed to start"
+    fi
+
+    if [ "${WAIT_VLM_S:-0}" -gt 0 ] 2>/dev/null; then
+      step "watching for the VLM in the background (up to ${WAIT_VLM_S}s)"
+      join_reasoning_when_ready &
     fi
 
     step "mediamtx (RTSP :8554 · WebRTC :8889 · HLS :8888)"

@@ -2,6 +2,7 @@
 # Runs ON THE JETSON. Start/stop the Phase 2 background services.
 #
 #   ./scripts/run_services.sh start [--from-start]   event service (+ redis check)
+#   ./scripts/run_services.sh reasoning                start ONLY the reasoning service
 #   ./scripts/run_services.sh stop
 #   ./scripts/run_services.sh status
 #   ./scripts/run_services.sh reset                  wipe stream + database, then start clean
@@ -44,6 +45,29 @@ notify_pids() {
   ps -eo pid,args | grep '[n]otify_service.py' | grep -v 'bash -c' | awk '{print $1}'
 }
 
+# Reasoning is optional and only useful with a VLM endpoint up. `nice` keeps it preemptible: it
+# shares the GPU with 20 camera streams and the hot path must always win.
+#
+# Split out so it can be started ON ITS OWN, after the rest. The model server takes minutes to
+# load — and on a container's first boot, longer still while it pulls ~12 GB of weights — and
+# there is no reason for the dashboard and the pipeline to wait on that. `run_services.sh
+# reasoning` is what joins the reasoning layer to a system that is already running.
+start_reasoning() {
+  if ! curl -sf --max-time 3 "$(python3 -c "import yaml;print(yaml.safe_load(open('configs/services.yml'))['reasoning']['endpoint'])")/models" >/dev/null 2>&1; then
+    echo "!! no VLM endpoint — reasoning service NOT started."
+    echo "!!   ./scripts/setup_reasoning.sh llamacpp --serve   (or bring up the vlm container)"
+    return 1
+  fi
+  PIDS=$(reason_pids); [ -n "$PIDS" ] && { echo "$PIDS" | xargs -r kill -9; sleep 1; }
+  nohup setsid nice -n 10 python3 services/reasoning_service.py > "$REASONLOG" 2>&1 < /dev/null &
+  sleep 2
+  if [ -n "$(reason_pids)" ]; then
+    echo "==> reasoning service up (log: $REASONLOG)"
+  else
+    echo "!! reasoning service failed:"; tail -10 "$REASONLOG"; return 1
+  fi
+}
+
 case "${1:-}" in
   start|reset)
     redis-cli ping >/dev/null 2>&1 || {
@@ -83,18 +107,7 @@ case "${1:-}" in
       echo "!! clip service failed to start:"; tail -20 "$CLIPLOG"
     fi
 
-    # Reasoning is optional and only useful with a VLM endpoint up. `nice` keeps it preemptible:
-    # it shares the iGPU with 20 camera streams and the hot path must always win.
-    if curl -sf --max-time 3 "$(python3 -c "import yaml;print(yaml.safe_load(open('configs/services.yml'))['reasoning']['endpoint'])")/models" >/dev/null 2>&1; then
-      PIDS=$(reason_pids); [ -n "$PIDS" ] && { echo "$PIDS" | xargs -r kill -9; sleep 1; }
-      nohup setsid nice -n 10 python3 services/reasoning_service.py > "$REASONLOG" 2>&1 < /dev/null &
-      sleep 2
-      [ -n "$(reason_pids)" ] && echo "==> reasoning service up (log: $REASONLOG)" \
-                             || { echo "!! reasoning service failed:"; tail -10 "$REASONLOG"; }
-    else
-      echo "!! no VLM endpoint — reasoning service NOT started."
-      echo "!!   ./scripts/setup_reasoning.sh llamacpp --serve"
-    fi
+    start_reasoning
 
     # Outbound notifications. Started only when enabled in configs/services.yml AND credentials
     # are present: this is the one component that sends anything off the device, and an alert
@@ -126,6 +139,10 @@ case "${1:-}" in
     else
       echo "!! API failed to start:"; tail -15 "$APILOG"
     fi
+    ;;
+
+  reasoning)
+    start_reasoning || exit 1
     ;;
 
   stop)

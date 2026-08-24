@@ -48,6 +48,9 @@ services:
       ISMS_AUTOSTART: "${ISMS_AUTOSTART:-1}"
       ISMS_WIPE: "${ISMS_WIPE:-1}"
       ISMS_ENGINE_BATCH: "${ISMS_ENGINE_BATCH:-20}"
+      # How long to keep watching for the VLM before giving up and running vision-only. The wait
+      # happens in the background, so it never delays the pipeline or the dashboard.
+      ISMS_WAIT_VLM_S: "${ISMS_WAIT_VLM_S:-2400}"
 
     volumes:
       # Footage. Read-only: the pipeline decodes it and clip_service cuts from it with
@@ -67,7 +70,72 @@ services:
       memlock: -1
       stack: 67108864
 
+  # ---------------------------------------------------------------------------------------------
+  # Reasoning layer
+  # ---------------------------------------------------------------------------------------------
+  # Two containers, one image. The VLM adjudicates every incident, so it must be cheap; the agent
+  # LLM answers human questions, so it can be bigger. Different duty cycles, and restarting one
+  # must never disturb the other.
+  #
+  # Nothing waits on these. They pull ~12 GB of weights on first boot and take minutes to load,
+  # and the vision path is not allowed to be hostage to that: the app starts immediately and joins
+  # the reasoning layer when it appears. Until then incidents stay `unverified`, which is the
+  # documented degraded mode, not a failure.
+
+  vlm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.llama
+      args:
+        CUDA_ARCHS: "${CUDA_ARCHS:-80;86;89;90}"
+    image: isms-llama:x86
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    environment:
+      ROLE: vlm
+      PORT: "8000"
+      # Only needed if a weights repo is gated. Read from docker/.env or the shell.
+      HF_TOKEN: "${HF_TOKEN:-}"
+      LLAMA_CTX_SIZE: "${VLM_CTX_SIZE:-8192}"
+    volumes:
+      - weights:/weights
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 60
+      # Generous: the first boot downloads ~7 GB before the server can answer anything.
+      start_period: 30m
+
+  llm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.llama
+      args:
+        CUDA_ARCHS: "${CUDA_ARCHS:-80;86;89;90}"
+    image: isms-llama:x86
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    environment:
+      ROLE: llm
+      PORT: "8001"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      LLAMA_CTX_SIZE: "${LLM_CTX_SIZE:-8192}"
+    volumes:
+      - weights:/weights
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/v1/models || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 60
+      start_period: 30m
+
 volumes:
   models:
   data:
   logs:
+  # ~12 GB of GGUF between the two models. A volume rather than image layers so the image stays
+  # portable and a redeploy does not re-pull them.
+  weights:
