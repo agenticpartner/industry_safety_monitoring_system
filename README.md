@@ -108,8 +108,13 @@ dashboard's `/system` page.
 
 ## Hardware requirements
 
-This targets **NVIDIA Jetson**. It is not portable to x86 as written — power modes, DLA, NVDEC
-budgets, `tegrastats` and the CUDA build flags are all Tegra-specific.
+Two platforms. **Jetson** is the reference target and runs on the host. **x86_64 with a discrete
+NVIDIA GPU** runs in Docker — see [Deploying on x86](#deploying-on-x86).
+
+The platform-specific parts are detected, not assumed: power modes and locked clocks are Tegra
+tools and are skipped elsewhere, DLA exists only on Jetson, and the dashboard's system chart reads
+`tegrastats` on Jetson and `nvidia-smi` on a discrete card. `./scripts/check_hardware.sh` reports
+which platform it found.
 
 | | Minimum | Reference platform |
 |---|---|---|
@@ -188,6 +193,75 @@ without it the tracker fails to load with a message that names the tracker, not 
 
 Flags: `--check-only`, `--skip-apt`, `--no-perf-mode`, `--yes`. It is idempotent — re-run it
 freely.
+
+---
+
+## Deploying on x86
+
+Any cloud GPU instance with Docker and the NVIDIA Container Toolkit:
+
+```bash
+docker compose -f docker/compose.yml up -d --build
+```
+
+Then `http://<host>:8080/`. Nothing else is run by hand — the container builds its own TensorRT
+engines, brings up the services and starts the pipeline.
+
+Four containers, all on host networking so `configs/services.yml` keeps addressing `127.0.0.1`
+and one set of configs stays correct on both platforms:
+
+| | |
+|---|---|
+| `redis` | the event bus |
+| `app` | pipeline, services, dashboard, mediamtx |
+| `vlm` | Cosmos Reason 2 on `:8000`, adjudicates incidents |
+| `llm` | Nemotron Nano 9B on `:8001`, answers questions |
+
+Three things are not in the image. **Engines** are specific to the GPU, driver and TensorRT that
+built them, so they are built on first boot (~8 minutes) and stamped with the compute capability
+that did it; moving the volume to another card rebuilds. **Media** is mounted from `./media`.
+**Model weights** are ~11 GB, pulled to a volume on first boot. ONNX *is* baked, from a separate
+build stage — it is architecture-independent.
+
+The reasoning containers are slow to arrive on a cold start, and nothing waits for them: the
+dashboard and the pipeline come up immediately and the reasoning layer joins when the VLM answers.
+Until then incidents stay `unverified`.
+
+### Configuration
+
+Environment, read by `docker/compose.yml`:
+
+| | |
+|---|---|
+| `ISMS_STREAMS` | cameras, default 20 |
+| `ISMS_SOURCE` | `file` or `rtsp` |
+| `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
+| `ISMS_RTSP_URLS` | comma-separated per-camera URLs; position is the camera id |
+| `ISMS_WIPE` | wipe previous incidents on start, default 1 |
+| `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` |
+
+Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
+committed — the same reason `HF_TOKEN` lives in `.env`.
+
+`docker compose --profile sources up -d sources` publishes the demo media as 20 RTSP cameras on
+`:8654`, for exercising the live path on a single box. `scripts/serve_rtsp_sources.sh` describes
+why that is not a deployment topology.
+
+### Measured on an L4
+
+24 GB VRAM, 20 streams, `drop_frame_interval: 2`, zones and events on, full reasoning stack up.
+
+| | file sources | 20 RTSP cameras |
+|---|---|---|
+| Throughput | **616 fps** flat out | **301 fps**, keeping pace with 20 real-time cameras |
+| Cost of the reasoning layer | −0.5% | |
+| VRAM | | **15631 MiB of 23034** — 7028 LLM, 5620 VLM, 2948 pipeline |
+| VLM verdict | | 3.2–6.2 s PPE, 8.0–9.5 s overcrowding |
+
+Engine throughput is 1869 inf/s for PPE and 801 inf/s for fire, against budgets of 300 and 100.
+
+DeepStream 9.1 documents driver 590+ for dGPU. Below that the container supplies its own newer
+user-mode driver through CUDA forward compatibility — measured working on 580.126.20.
 
 ---
 
@@ -442,6 +516,7 @@ dashboard/      the operator UI and the developer reference page
 models/         label files and the custom TensorRT output parser
 bench/          measured results — the source for every number quoted anywhere
 requirements/   Python dependencies, one file per virtualenv
+docker/         the x86 images, compose file and entrypoints
 .claude/skills/ 28 NVIDIA agent skills (DeepStream, Jetson, VSS)
 ```
 
