@@ -988,10 +988,15 @@ class FrameCapture(BufferOperator):
         super().__init__()
         # Imported here, not at module scope: the pipeline must still run on plain system python
         # when capture is off, and torch only exists in the --system-site-packages venv.
+        import torch  # noqa: PLC0415
         from torch.utils.dlpack import from_dlpack  # noqa: PLC0415
         import cv2  # noqa: PLC0415
         self._from_dlpack = from_dlpack
         self._cv2 = cv2
+        self._torch = torch
+        # Whether reading the extracted surface needs an explicit device sync — see the note in
+        # handle_buffer. Only on a discrete GPU, so it is decided once here rather than per frame.
+        self._needs_sync = bool(torch.cuda.is_available()) and not Path("/etc/nv_tegra_release").exists()
         self.pipeline = pipeline
         self.emitter = emitter
         self.crops_dir = crops_dir
@@ -1066,6 +1071,20 @@ class FrameCapture(BufferOperator):
                 # batch_id, NOT source_id: extract() indexes the position in this batch, and a
                 # partial batch makes the two diverge.
                 gpu = self._from_dlpack(buffer.extract(frame.batch_id))
+                # `extract()` hands back the surface itself, not a copy, and `from_dlpack` wraps it
+                # without copying either — so the device-to-host copy in _write races the
+                # `nvvideoconvert` that produces it. They are on different CUDA streams and the raw
+                # capsule carries no stream for DLPack's exchange protocol to synchronise on.
+                #
+                # On Jetson the memory is unified and this almost never surfaces. On a discrete GPU
+                # it does: measured here, 12 of 81 crops came back as flat green — R and B at zero,
+                # G saturated — which is a partially written surface, not a colour-format error.
+                # Intermittent and silent, and the VLM answers about them in good faith.
+                #
+                # A full device sync is the blunt instrument, and it is the right one: this runs
+                # only while the valve is open, which is once per incident rather than per frame.
+                if self._needs_sync:
+                    self._torch.cuda.synchronize()
                 for event_id, bbox, etype, track_id in reqs:
                     self._write(gpu, bbox, event_id, sid + 1, etype, track_id)
         except Exception as e:  # noqa: BLE001
