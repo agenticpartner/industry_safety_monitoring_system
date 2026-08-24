@@ -254,7 +254,7 @@ anonymously; `HF_TOKEN` is only for a gated repository, and Telegram alerts are 
 If you do want either, the file has to exist **before** the containers are created:
 
 ```bash
-cp .env.example .env && chmod 600 .env
+cp .env.example .env && chmod 600 .env      # credentials
 $EDITOR .env
 ```
 
@@ -267,7 +267,8 @@ $EDITOR .env
 docker compose -f docker/compose.yml up -d --build
 ```
 
-Then `http://<host>:8080/`.
+Then `http://<host>:8080/`. That runs **20 file sources from `media/`** — see
+[Configuration](#configuration) for the RTSP path and `docker/.env`.
 
 First boot builds the TensorRT engines against the GPU that is present (~8 minutes) and pulls
 ~11 GB of model weights. Both land on named volumes, so every later start skips them. Nothing is
@@ -329,7 +330,21 @@ volume. ONNX *is* baked, from a separate build stage — it is architecture-inde
 
 ### Configuration
 
-Environment, read by `docker/compose.yml`:
+**File mode is the default.** `docker compose up -d` with nothing else set runs 20 file sources
+from `media/`; RTSP is opt-in.
+
+Two env files, with different jobs, because Compose treats them differently:
+
+| | |
+|---|---|
+| `docker/.env` | what the deployment **is** — source mode, stream count, camera addresses. Compose reads it to substitute `${...}` in `compose.yml`, and looks for it beside the compose file. Template: `docker/.env.example` |
+| `<repo>/.env` | **credentials**, injected into the containers by `env_file`. The same file `scripts/env.sh` sources on the Jetson. Template: `.env.example` |
+
+An `ISMS_*` value in the repo-root `.env` does not work: Compose interpolates from `docker/`, and
+the `environment:` block then overrides whatever `env_file` supplied. It fails silently and the
+deployment runs with the default. Either use `docker/.env`, or set it on the command line.
+
+Settings, in `docker/.env` or per-command:
 
 | | |
 |---|---|
