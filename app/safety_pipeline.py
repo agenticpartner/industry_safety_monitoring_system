@@ -503,21 +503,36 @@ def load_zone_severity(streams: int) -> dict[int, dict[str, str]]:
 
 def resolve_sources(cfg: dict, count: int, mode: str) -> list[str]:
     if mode == "rtsp":
+        # The environment wins over the config file, for both forms.
+        #
+        # A camera address is deployment configuration, not a property of the software: the same
+        # image runs against a different fleet at every site, and configs/demo.yml ships a
+        # CHANGE-ME placeholder precisely because it cannot know one. More pointedly, real camera
+        # URLs carry credentials — `rtsp://user:pw@host/...` — and configs/demo.yml is committed,
+        # so a fleet written in there is a password in the repository history forever. That is the
+        # same reasoning that keeps HF_TOKEN and the Telegram credentials in .env, which
+        # scripts/env.sh already sources into the environment this reads.
+        #
+        #   ISMS_RTSP_URLS   comma-separated, one per camera; position is the camera id
+        #   ISMS_RTSP_BASE   overrides sources.rtsp_base, keeping rtsp_pattern
+        env_urls = [u.strip() for u in os.environ.get("ISMS_RTSP_URLS", "").split(",") if u.strip()]
+
         # Explicit per-camera URLs win when present. This is the production path: real cameras
         # are individual devices with their own hostnames, credentials and vendor-specific paths
         # (`rtsp://user:pw@10.0.0.5/Streaming/Channels/101`), and no printf pattern spans a
         # mixed fleet. `rtsp_base` + `rtsp_pattern` stays for the demo, where twenty streams do
         # come off one server with numbered mounts.
-        urls = [u for u in (cfg["sources"].get("rtsp_urls") or []) if str(u).strip()]
+        urls = env_urls or [u for u in (cfg["sources"].get("rtsp_urls") or []) if str(u).strip()]
         if urls:
             if len(urls) < count:
+                where = "ISMS_RTSP_URLS" if env_urls else "sources.rtsp_urls"
                 raise SystemExit(
-                    f"sources.rtsp_urls lists {len(urls)} camera(s) but {count} streams were "
+                    f"{where} lists {len(urls)} camera(s) but {count} streams were "
                     f"requested — add the missing URLs or lower pipeline.streams")
             # Camera N is urls[N-1]: the position in this list IS the camera id the dashboard,
             # the zone config and the clip prefixes all key on.
             return [str(u).strip() for u in urls[:count]]
-        base = cfg["sources"]["rtsp_base"].rstrip("/")
+        base = (os.environ.get("ISMS_RTSP_BASE") or cfg["sources"]["rtsp_base"]).rstrip("/")
         pattern = cfg["sources"]["rtsp_pattern"]
         return [f"{base}/{pattern % (i + 1)}" for i in range(count)]
 

@@ -51,6 +51,10 @@ services:
       # How long to keep watching for the VLM before giving up and running vision-only. The wait
       # happens in the background, so it never delays the pipeline or the dashboard.
       ISMS_WAIT_VLM_S: "${ISMS_WAIT_VLM_S:-2400}"
+      # Camera addresses come from the environment, never from the committed config: real URLs
+      # carry credentials, and the same image runs against a different fleet at every site.
+      ISMS_RTSP_BASE: "${ISMS_RTSP_BASE:-}"
+      ISMS_RTSP_URLS: "${ISMS_RTSP_URLS:-}"
 
     volumes:
       # Footage. Read-only: the pipeline decodes it and clip_service cuts from it with
@@ -131,6 +135,42 @@ services:
       timeout: 5s
       retries: 60
       start_period: 30m
+
+  # ---------------------------------------------------------------------------------------------
+  # RTSP camera farm — a TEST RIG, not part of a deployment
+  # ---------------------------------------------------------------------------------------------
+  # Behind a profile, so it never starts by accident:
+  #
+  #     docker compose -f docker/compose.yml --profile sources up -d
+  #     ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
+  #       docker compose -f docker/compose.yml up -d app
+  #
+  # In production the cameras ARE separate devices and this does not exist; scripts/
+  # serve_rtsp_sources.sh says so in its own header, and running the restreamers beside the
+  # inference they feed is exactly what it warns against. It is here because the RTSP ingest path
+  # — reconnection, TCP transport, and smart-record evidence clips — is otherwise untestable on a
+  # single cloud instance, and those are behaviours, not throughput.
+  #
+  # Any fps measured with this running describes a box doing both jobs and is not comparable to a
+  # figure taken against cameras on a network.
+  #
+  # Port 8654, not 8554: the app's own mediamtx holds 8554 for the tiled output, and with host
+  # networking there is one port space.
+  sources:
+    profiles: ["sources"]
+    image: isms:x86
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      RTSP_PORT: "8654"
+    volumes:
+      - ../media:/opt/isms/media:ro
+    # The script backgrounds mediamtx and the restreamers and returns; the tail is what gives the
+    # container something to be.
+    command:
+      - bash
+      - -c
+      - "scripts/serve_rtsp_sources.sh start ${ISMS_STREAMS:-20} && tail -f build/mediamtx-sources.log"
 
 volumes:
   models:
