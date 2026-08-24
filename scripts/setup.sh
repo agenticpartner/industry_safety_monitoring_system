@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# One-shot installer. Runs ON THE JETSON. Idempotent — safe to re-run at any point.
+# One-shot installer for a BARE-METAL install. Idempotent — safe to re-run at any point.
+#
+# Jetson is the reference target. It also runs on x86_64 with a discrete NVIDIA card, where the
+# Tegra-only steps (power mode, locked clocks) are skipped and the mediamtx download follows the
+# host architecture. The x86 path that gets exercised is docker/Dockerfile, which does the same
+# work in layers; this script is what a host install uses.
 #
 #   ./scripts/setup.sh                  check hardware, then install everything
 #   ./scripts/setup.sh --check-only     run the hardware probe and stop
@@ -150,7 +155,15 @@ step "[6/8] mediamtx  (RTSP / WebRTC / HLS republisher)"
 MEDIAMTX_VER="v1.20.0"
 mkdir -p "${ROOT}/build/bin"
 if [ ! -x "${ROOT}/build/bin/mediamtx" ]; then
-  URL="https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VER}/mediamtx_${MEDIAMTX_VER}_linux_arm64.tar.gz"
+  # The release asset name carries the architecture, so it follows the host rather than the
+  # reference platform. A wrong one downloads and unpacks happily, then fails at exec with
+  # "cannot execute binary file" — a long way from this line.
+  case "$(uname -m)" in
+    aarch64|arm64) MTX_ARCH=arm64 ;;
+    x86_64|amd64)  MTX_ARCH=amd64 ;;
+    *) die "no mediamtx release for $(uname -m)" ;;
+  esac
+  URL="https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VER}/mediamtx_${MEDIAMTX_VER}_linux_${MTX_ARCH}.tar.gz"
   echo "    fetching ${MEDIAMTX_VER}"
   curl -fsSL "$URL" | tar xz -C "${ROOT}/build/bin" mediamtx || die "mediamtx download failed"
 fi
@@ -180,7 +193,11 @@ else
   echo "    .env already present, left untouched"
 fi
 
-if [ "$NO_PERF" = 1 ]; then
+if [ "${DETECTED_PLATFORM:-}" = dgpu ] || ! command -v nvpmodel >/dev/null 2>&1; then
+  # nvpmodel and jetson_clocks are Tegra tools. A discrete card has no equivalent worth setting
+  # here: it clocks itself, and `nvidia-smi -lgc` would pin frequencies the driver manages better.
+  echo "    not a Jetson: no power mode to set"
+elif [ "$NO_PERF" = 1 ]; then
   echo "    --no-perf-mode: leaving nvpmodel / clocks alone"
 else
   # MAXN + locked clocks. Without this the governor throttles mid-run and throughput numbers

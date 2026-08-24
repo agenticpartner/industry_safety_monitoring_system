@@ -6,6 +6,11 @@
 #
 # Exit code is 0 when nothing FAILed, 1 otherwise, so it can gate a deploy.
 #
+# Two platforms, one script. `jetson` is the reference target; `dgpu` is x86_64 with a discrete
+# NVIDIA card, which is how the Docker image runs. The checks that differ are the ones tied to
+# Tegra silicon — DLA, tegrastats, NVDEC device nodes, the board string — and each is gated on
+# PLATFORM rather than skipped by accident.
+#
 # Every check below exists because getting it wrong produces a failure a long way from its cause.
 # The tracker's "Failed to initilaize low level lib", nvinfer's "setDimensions: Error Code 3" and
 # nv3dsink's "no display found" all look like pipeline bugs and are all environment problems.
@@ -27,7 +32,7 @@ head_() { [ "$QUIET" = 1 ] || printf "\n\033[1m%s\033[0m\n" "$1"; }
 
 # Values other scripts can consume: this script writes them to build/hardware.env when it can.
 DETECTED_BOARD=""; DETECTED_L4T=""; DETECTED_CUDA_ARCH=""; DETECTED_DISPLAY=""
-DETECTED_DLA=0; DETECTED_RAM_GB=0
+DETECTED_DLA=0; DETECTED_RAM_GB=0; DETECTED_PLATFORM=""; DETECTED_VRAM_MB=0
 
 [ "$QUIET" = 1 ] || cat <<'BANNER'
 ==============================================================
@@ -39,36 +44,76 @@ BANNER
 head_ "Platform"
 # ---------------------------------------------------------------------------------------------
 ARCH="$(uname -m)"
-if [ "$ARCH" != "aarch64" ]; then
-  bad "architecture" "$ARCH — this project targets NVIDIA Jetson (aarch64)"
-else
-  ok "architecture" "$ARCH"
-fi
 
-# /proc/device-tree/model is the authoritative board string on Tegra. It is NUL-terminated, hence
-# the tr.
+# Tegra is identified by the device tree, never by the architecture alone: aarch64 is also every
+# ARM server and every Apple VM. /proc/device-tree/model is the authoritative board string there,
+# and it is NUL-terminated, hence the tr.
 if [ -r /proc/device-tree/model ]; then
   DETECTED_BOARD="$(tr -d '\0' < /proc/device-tree/model)"
 fi
-if [ -n "$DETECTED_BOARD" ]; then
-  case "$DETECTED_BOARD" in
-    *AGX*Orin*|*"AGX Orin"*)  ok   "board" "$DETECTED_BOARD" ;;
-    *Orin*)                   warn "board" "$DETECTED_BOARD — measured on AGX Orin 64GB; expect a lower stream ceiling here" ;;
-    *Thor*|*T264*)            warn "board" "$DETECTED_BOARD — newer than the measured target; CUDA arch and DLA behaviour differ" ;;
-    *)                        warn "board" "$DETECTED_BOARD — not an Orin; nothing below is calibrated for it" ;;
-  esac
+if [ -n "$DETECTED_BOARD" ] || [ -r /etc/nv_tegra_release ]; then
+  DETECTED_PLATFORM=jetson
+elif [ "$ARCH" = "x86_64" ] && command -v nvidia-smi >/dev/null 2>&1; then
+  DETECTED_PLATFORM=dgpu
 else
-  bad "board" "no /proc/device-tree/model — this does not look like a Jetson"
+  DETECTED_PLATFORM=unknown
 fi
 
-if [ -r /etc/nv_tegra_release ]; then
-  DETECTED_L4T="$(awk '{print $2, $5, $6}' /etc/nv_tegra_release | tr -d ',' | head -1)"
-  ok "L4T release" "$DETECTED_L4T"
-elif dpkg -s nvidia-jetpack >/dev/null 2>&1; then
-  DETECTED_L4T="$(dpkg -s nvidia-jetpack 2>/dev/null | awk '/^Version:/{print $2}')"
-  ok "JetPack" "$DETECTED_L4T"
-else
-  warn "L4T / JetPack" "could not determine version"
+case "$DETECTED_PLATFORM" in
+  jetson) ok "platform" "$ARCH — NVIDIA Jetson (reference target)" ;;
+  dgpu)   ok "platform" "$ARCH — discrete NVIDIA GPU" ;;
+  *)      bad "platform" "$ARCH with no Tegra device tree and no nvidia-smi — no NVIDIA GPU found" ;;
+esac
+
+if [ "$DETECTED_PLATFORM" = jetson ]; then
+  if [ -n "$DETECTED_BOARD" ]; then
+    case "$DETECTED_BOARD" in
+      *AGX*Orin*|*"AGX Orin"*)  ok   "board" "$DETECTED_BOARD" ;;
+      *Orin*)                   warn "board" "$DETECTED_BOARD — measured on AGX Orin 64GB; expect a lower stream ceiling here" ;;
+      *Thor*|*T264*)            warn "board" "$DETECTED_BOARD — newer than the measured target; CUDA arch and DLA behaviour differ" ;;
+      *)                        warn "board" "$DETECTED_BOARD — not an Orin; nothing below is calibrated for it" ;;
+    esac
+  else
+    bad "board" "no /proc/device-tree/model — this does not look like a Jetson"
+  fi
+
+  if [ -r /etc/nv_tegra_release ]; then
+    DETECTED_L4T="$(awk '{print $2, $5, $6}' /etc/nv_tegra_release | tr -d ',' | head -1)"
+    ok "L4T release" "$DETECTED_L4T"
+  elif dpkg -s nvidia-jetpack >/dev/null 2>&1; then
+    DETECTED_L4T="$(dpkg -s nvidia-jetpack 2>/dev/null | awk '/^Version:/{print $2}')"
+    ok "JetPack" "$DETECTED_L4T"
+  else
+    warn "L4T / JetPack" "could not determine version"
+  fi
+
+elif [ "$DETECTED_PLATFORM" = dgpu ]; then
+  DETECTED_BOARD="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  DETECTED_VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+  DETECTED_VRAM_MB="${DETECTED_VRAM_MB:-0}"
+  [ -n "$DETECTED_BOARD" ] && ok "gpu" "$DETECTED_BOARD" || bad "gpu" "nvidia-smi returned no device"
+
+  # VRAM is the constraint that does not exist on Jetson, where the 64 GB is unified and the model
+  # servers draw from the same pool as the pipeline. Here they compete for a fixed, much smaller
+  # budget: ~13 GB for both llama.cpp servers, ~7 GB for the engines and twenty decode contexts.
+  if   [ "${DETECTED_VRAM_MB:-0}" -ge 40000 ]; then ok   "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB"
+  elif [ "${DETECTED_VRAM_MB:-0}" -ge 20000 ]; then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — fits the full stack with little headroom; quantise the VLM if llama.cpp fails to allocate"
+  elif [ "${DETECTED_VRAM_MB:-0}" -gt 0 ];     then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — run the vision path only, or reduce the stream count"
+  else                                              warn "VRAM" "could not read memory.total"
+  fi
+
+  # DeepStream 9.1 documents driver 590+ for dGPU. A lower kernel driver still works when the
+  # container supplies its own newer user-mode driver (CUDA forward compatibility, datacenter GPUs
+  # only) — measured working on 580.126.20 with an L4. Outside a container it is a real floor.
+  DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+  DRV_MAJOR="${DRV%%.*}"
+  if [ -n "$DRV_MAJOR" ] && [ "$DRV_MAJOR" -ge 590 ] 2>/dev/null; then
+    ok "driver" "$DRV"
+  elif [ -n "${CUDA_DRIVER_CAPABILITIES:-}" ] || [ -d /usr/local/cuda/compat ]; then
+    ok "driver" "$DRV (below the documented 590+, satisfied by CUDA forward compatibility)"
+  else
+    warn "driver" "$DRV — DeepStream 9.1 documents 590+ for dGPU; run in the container, which carries a newer user-mode driver"
+  fi
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -177,20 +222,40 @@ else
     || warn "nvcc" "not found — needed only for the optional reasoning layer (llama.cpp)"
 fi
 
-# DLA is optional: no model has passed the all-or-nothing qualification gate, so the shipped
-# configuration is GPU-only. Reported because qualify_dla.sh needs to know the cores exist.
-DETECTED_DLA=$(ls -d /sys/class/nvdla* /dev/nvhost-nvdla* 2>/dev/null | wc -l | tr -d ' ')
-[ "${DETECTED_DLA:-0}" -gt 0 ] && ok "DLA cores" "$DETECTED_DLA detected (optional — models run on GPU)" \
-  || warn "DLA cores" "none detected — scripts/qualify_dla.sh will not apply"
+if [ "$DETECTED_PLATFORM" = jetson ]; then
+  # DLA is optional: no model has passed the all-or-nothing qualification gate, so the shipped
+  # configuration is GPU-only. Reported because qualify_dla.sh needs to know the cores exist.
+  DETECTED_DLA=$(ls -d /sys/class/nvdla* /dev/nvhost-nvdla* 2>/dev/null | wc -l | tr -d ' ')
+  [ "${DETECTED_DLA:-0}" -gt 0 ] && ok "DLA cores" "$DETECTED_DLA detected (optional — models run on GPU)" \
+    || warn "DLA cores" "none detected — scripts/qualify_dla.sh will not apply"
 
-command -v tegrastats >/dev/null 2>&1 && ok "tegrastats" "$(command -v tegrastats)" \
-  || warn "tegrastats" "not found — the dashboard system chart will be empty"
+  command -v tegrastats >/dev/null 2>&1 && ok "tegrastats" "$(command -v tegrastats)" \
+    || warn "tegrastats" "not found — the dashboard system chart will be empty"
 
-# NVDEC is what caps the stream count: 20×1080p30 H.265 is 91% of the measured AGX Orin ceiling.
-if [ -e /dev/nvidia0 ] || [ -e /dev/nvhost-nvdec ] || [ -d /sys/class/nvidia-nvdec ]; then
-  ok "NVDEC" "present"
+  # NVDEC is what caps the stream count: 20×1080p30 H.265 is 91% of the measured AGX Orin ceiling.
+  if [ -e /dev/nvidia0 ] || [ -e /dev/nvhost-nvdec ] || [ -d /sys/class/nvidia-nvdec ]; then
+    ok "NVDEC" "present"
+  else
+    warn "NVDEC" "device node not visible — decode ceiling unverified (run scripts/decode_sweep.sh)"
+  fi
+
 else
-  warn "NVDEC" "device node not visible — decode ceiling unverified (run scripts/decode_sweep.sh)"
+  # No DLA on any discrete card, and no tegrastats: services/metrics.py reads nvidia-smi instead.
+  # `utilization.decoder` is the NVDEC field the dashboard binds to, and it is not universal —
+  # it is absent on some consumer cards, where the system chart loses that one series.
+  if nvidia-smi --query-gpu=utilization.decoder --format=csv,noheader >/dev/null 2>&1; then
+    ok "NVDEC telemetry" "nvidia-smi reports utilization.decoder"
+  else
+    warn "NVDEC telemetry" "nvidia-smi does not report utilization.decoder — the dashboard NVDEC series will be empty"
+  fi
+
+  # NVENC is what the --rtsp-out branch encodes the tiled wall with. A100 and H100 have none, and
+  # nvv4l2h264enc fails at graph construction there rather than at run time.
+  if nvidia-smi --query-gpu=utilization.encoder --format=csv,noheader >/dev/null 2>&1; then
+    ok "NVENC telemetry" "nvidia-smi reports utilization.encoder"
+  else
+    warn "NVENC" "no encoder telemetry — if this card has no NVENC, run without --rtsp-out"
+  fi
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -243,12 +308,14 @@ fi
 # Persist what other scripts need, so nothing has to re-probe or hardcode.
 mkdir -p build 2>/dev/null && cat > build/hardware.env <<EOF
 # Generated by scripts/check_hardware.sh — regenerate rather than edit.
+DETECTED_PLATFORM="${DETECTED_PLATFORM}"
 DETECTED_BOARD="${DETECTED_BOARD}"
 DETECTED_L4T="${DETECTED_L4T}"
 DETECTED_CUDA_ARCH="${DETECTED_CUDA_ARCH}"
 DETECTED_DISPLAY="${DETECTED_DISPLAY}"
 DETECTED_DLA="${DETECTED_DLA}"
 DETECTED_RAM_GB="${DETECTED_RAM_GB}"
+DETECTED_VRAM_MB="${DETECTED_VRAM_MB}"
 EOF
 
 printf "\n──────────────────────────────────────────────────────────────\n"
