@@ -140,7 +140,10 @@ check exists because getting it wrong produces a failure a long way from its cau
 
 ---
 
-## Quick start
+## Quick start — Jetson
+
+A host install. For x86 see [Deploying on x86](#deploying-on-x86), which is a container and needs
+none of this.
 
 ```bash
 git clone <your-fork-url> industry_safety_monitoring_system
@@ -198,17 +201,100 @@ freely.
 
 ## Deploying on x86
 
-Any cloud GPU instance with Docker and the NVIDIA Container Toolkit:
+From nothing to a running system on any cloud GPU instance. Every step below was run on an L4.
+
+### 1. The instance
+
+Docker and the NVIDIA Container Toolkit, and a GPU the toolkit can see:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi -L
+```
+
+~60 GB of free disk: the image is ~33 GB, the model weights ~11 GB, and the clip budget 4 GB.
+
+DeepStream 9.1 documents driver 590+ for dGPU. Below that the container supplies its own newer
+user-mode driver through CUDA forward compatibility — measured working on 580.126.20 with an L4.
+
+### 2. Clone
+
+```bash
+git clone <your-fork-url> industry_safety_monitoring_system
+cd industry_safety_monitoring_system
+```
+
+### 3. Put the footage in place
+
+`media/` is gitignored, so a clone has none — the demo set is 454 MB and travels separately from
+the repository. Copy it to `media/` at the repo root:
+
+```bash
+rsync -avz --progress ./media/cam*.mp4 user@instance:industry_safety_monitoring_system/media/
+```
+
+The names are the contract. `media/cam01.mp4 … cam20.mp4`, and the number **is** the camera id
+that `configs/analytics/zones.yml`, the OSD label, the clip prefixes and the dashboard all key on
+— renumbering the files renames every camera. Each clip is 1920x1080, 30 fps, H.265.
+
+To build a set from your own footage instead, drop it in `media/src/` and:
+
+```bash
+docker compose -f docker/compose.yml --profile media run --rm media
+```
+
+That re-encodes whatever it finds into the 20-camera set, hardware-encoded through `hevc_nvenc`.
+With `media/src/` empty it falls back to the H.265 sample DeepStream ships, which contains no
+helmets, vests or fire — it satisfies the decode benchmark and nothing else.
+
+### 4. Bring it up
 
 ```bash
 docker compose -f docker/compose.yml up -d --build
 ```
 
-Then `http://<host>:8080/`. Nothing else is run by hand — the container builds its own TensorRT
-engines, brings up the services and starts the pipeline.
+Then `http://<host>:8080/`.
 
-Four containers, all on host networking so `configs/services.yml` keeps addressing `127.0.0.1`
-and one set of configs stays correct on both platforms:
+First boot builds the TensorRT engines against the GPU that is present (~8 minutes) and pulls
+~11 GB of model weights. Both land on named volumes, so every later start skips them. Nothing is
+run by hand.
+
+The reasoning containers are slow to arrive and nothing waits for them: the dashboard and the
+pipeline come up immediately, and the reasoning layer joins when the VLM answers. Until then
+incidents read `unverified`.
+
+```bash
+curl -s localhost:8080/health                       # every component, one line
+docker compose -f docker/compose.yml logs -f app    # engine build, then the pipeline
+docker compose -f docker/compose.yml down           # stop; volumes survive
+```
+
+### 5. Live cameras
+
+Point it at real RTSP cameras, one URL per camera, position being the camera id:
+
+```bash
+ISMS_SOURCE=rtsp \
+ISMS_RTSP_URLS="rtsp://user:pw@10.0.0.11/Streaming/Channels/101,rtsp://user:pw@10.0.0.12/axis-media/media.amp" \
+  docker compose -f docker/compose.yml up -d app
+```
+
+Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
+committed — the same reason `HF_TOKEN` lives in `.env`.
+
+Without cameras, `--profile sources` republishes the demo media as 20 RTSP streams on `:8654` so
+the live path can be exercised on one box. `scripts/serve_rtsp_sources.sh` describes why that is
+not a deployment topology, and any throughput measured that way is a box doing both jobs.
+
+```bash
+docker compose -f docker/compose.yml --profile sources up -d sources
+ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
+  docker compose -f docker/compose.yml up -d app
+```
+
+### What runs
+
+Four containers on host networking, so `configs/services.yml` keeps addressing `127.0.0.1` and one
+set of configs stays correct on both platforms.
 
 | | |
 |---|---|
@@ -217,15 +303,14 @@ and one set of configs stays correct on both platforms:
 | `vlm` | Cosmos Reason 2 on `:8000`, adjudicates incidents |
 | `llm` | Nemotron Nano 9B on `:8001`, answers questions |
 
-Three things are not in the image. **Engines** are specific to the GPU, driver and TensorRT that
-built them, so they are built on first boot (~8 minutes) and stamped with the compute capability
-that did it; moving the volume to another card rebuilds. **Media** is mounted from `./media`.
-**Model weights** are ~11 GB, pulled to a volume on first boot. ONNX *is* baked, from a separate
-build stage — it is architecture-independent.
+Everything except the dashboard (`:8080`) and mediamtx's RTSP and WebRTC listeners (`:8554`,
+`:8889`) binds loopback. Those three are what a browser reaches, and there is no authentication in
+front of them.
 
-The reasoning containers are slow to arrive on a cold start, and nothing waits for them: the
-dashboard and the pipeline come up immediately and the reasoning layer joins when the VLM answers.
-Until then incidents stay `unverified`.
+Three things are not in the image. **Engines** are specific to the GPU, driver and TensorRT that
+built them, so they are built on first boot and stamped with the compute capability that did it;
+moving the volume to another card rebuilds. **Media** is mounted. **Model weights** are pulled to a
+volume. ONNX *is* baked, from a separate build stage — it is architecture-independent.
 
 ### Configuration
 
@@ -235,22 +320,15 @@ Environment, read by `docker/compose.yml`:
 |---|---|
 | `ISMS_STREAMS` | cameras, default 20 |
 | `ISMS_SOURCE` | `file` or `rtsp` |
-| `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
 | `ISMS_RTSP_URLS` | comma-separated per-camera URLs; position is the camera id |
+| `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
 | `ISMS_WIPE` | wipe previous incidents on start, default 1 |
 | `ISMS_RGB_CAPTURE` | subject crops; unset follows the source mode — on for `rtsp`, off for `file` |
 | `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` |
 
-Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
-committed — the same reason `HF_TOKEN` lives in `.env`.
-
 Subject crops need CUDA torch in the image, ~3.5 GB; `--build-arg WITH_RGB_CAPTURE=0` leaves it
 out and the VLM falls back to context frames. Only RTSP needs it — in file mode the crop is cut
 from the source `.mp4` at the incident PTS.
-
-`docker compose --profile sources up -d sources` publishes the demo media as 20 RTSP cameras on
-`:8654`, for exercising the live path on a single box. `scripts/serve_rtsp_sources.sh` describes
-why that is not a deployment topology.
 
 ### Measured on an L4
 
@@ -259,16 +337,14 @@ why that is not a deployment topology.
 | | file sources | 20 RTSP cameras |
 |---|---|---|
 | Throughput | **616 fps** flat out | **301 fps**, keeping pace with 20 real-time cameras |
-| Cost of the reasoning layer | −0.5% | |
-| VRAM | | **15631 MiB of 23034** — 7028 LLM, 5620 VLM, 2948 pipeline |
-| VLM verdict | | 3.2–6.2 s PPE, 8.0–9.5 s overcrowding |
+| Cost of the reasoning layer | -0.5% | |
+| VRAM | | **15631 MiB of 23034** - 7028 LLM, 5620 VLM, 2948 pipeline |
+| VLM verdict | | 3.2-6.2 s PPE, 8.0-9.5 s overcrowding |
 
 Engine throughput is 1869 inf/s for PPE and 801 inf/s for fire, against budgets of 300 and 100.
 
-DeepStream 9.1 documents driver 590+ for dGPU. Below that the container supplies its own newer
-user-mode driver through CUDA forward compatibility — measured working on 580.126.20.
-
 ---
+
 
 ## Bring your own tokens
 
