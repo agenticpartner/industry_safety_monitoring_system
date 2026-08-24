@@ -149,6 +149,30 @@ services:
       start_period: 30m
 
   # ---------------------------------------------------------------------------------------------
+  # Media generation — run once, on a fresh clone
+  # ---------------------------------------------------------------------------------------------
+  # media/ is gitignored, so a clone has none. This builds the demo set from whatever is in
+  # media/src/, falling back to the H.265 sample bundled with DeepStream when that is empty:
+  #
+  #     docker compose -f docker/compose.yml --profile media run --rm media
+  #
+  # In the image rather than on the host because it needs ffmpeg, and the image's build has
+  # hevc_nvenc — hardware encode, which turns twenty 1080p clips from a long CPU job into a short
+  # one. `--gpus all` is for the encoder, not for inference.
+  #
+  # The only service that mounts media/ read-write; everything else only ever reads it.
+  media:
+    profiles: ["media"]
+    image: isms:x86
+    gpus: all
+    volumes:
+      - ../media:/opt/isms/media
+    command:
+      - bash
+      - -c
+      - "scripts/make_streams.sh ${ISMS_STREAMS:-20} ${ISMS_CLIP_SECONDS:-60}"
+
+  # ---------------------------------------------------------------------------------------------
   # RTSP camera farm — a TEST RIG, not part of a deployment
   # ---------------------------------------------------------------------------------------------
   # Behind a profile, so it never starts by accident:
