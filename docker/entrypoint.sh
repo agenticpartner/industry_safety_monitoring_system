@@ -15,6 +15,7 @@
 #   ISMS_WIPE=1            wipe previous incidents and clips first
 #   ISMS_ENGINE_BATCH=20   TensorRT engine batch. Must match `batch-size` in the nvinfer configs.
 #   ISMS_WAIT_VLM_S=2400   how long to keep watching for the VLM in the background. 0 disables.
+#   ISMS_RGB_CAPTURE       subject crops: 1 on, 0 off. Unset follows the source mode.
 set -uo pipefail
 cd "${ISMS_ROOT:-/opt/isms}"
 ROOT="$(pwd)"
@@ -194,9 +195,10 @@ case "${1:-serve}" in
         curl -sf -m 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
         sleep 1
       done
-      curl -s -m 180 -X POST \
-        "http://127.0.0.1:8080/pipeline/start?streams=${STREAMS}&source=${SOURCE}&rtsp_out=true" \
-        | sed 's/^/    /'
+      start_url="http://127.0.0.1:8080/pipeline/start?streams=${STREAMS}&source=${SOURCE}&rtsp_out=true"
+      # Unset means "let the API decide from the source mode", which is not the same as false.
+      [ -n "${ISMS_RGB_CAPTURE:-}" ] && start_url="${start_url}&rgb_capture=${ISMS_RGB_CAPTURE}"
+      curl -s -m 180 -X POST "$start_url" | sed 's/^/    /'
       echo
     fi
 

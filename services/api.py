@@ -197,7 +197,7 @@ def pipeline_status():
 
 @app.post("/pipeline/start", tags=["pipeline"])
 def pipeline_start(streams: int = Query(None, ge=1, le=20), source: str = Query(None),
-                   rtsp_out: bool = Query(False)):
+                   rtsp_out: bool = Query(False), rgb_capture: bool = Query(None)):
     """Start the pipeline detached. Refuses if one is already running.
 
     `rtsp_out` adds the encode branch that publishes the tiled wall to mediamtx. It is a start-time
@@ -213,6 +213,14 @@ def pipeline_start(streams: int = Query(None, ge=1, le=20), source: str = Query(
             "--no-display", "--zones", "--events", "--fps", "--stats"]
     if rtsp_out:
         args.append("--rtsp-out")
+    # Subject crops. Defaults to on for RTSP and off for file: over RTSP there is no source file
+    # to cut a crop from, so this branch is the only way to get one, while in file mode the crop
+    # comes out of the .mp4 at the incident PTS and the branch would be pure cost.
+    want_crop = rgb_capture
+    if want_crop is None:
+        want_crop = (source or DEMO["pipeline"]["source_mode"]) == "rtsp"
+    if want_crop:
+        args.append("--rgb-capture")
     log = ROOT / "logs/pipeline_api.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "wb") as fh:
@@ -870,6 +878,12 @@ def metrics_system(minutes: float = Query(5.0, ge=0.1, le=60),
         # The dashboard names it when reporting an error, so a failure reads as the tool that
         # actually failed rather than as whichever one this file was written against.
         "backend": SAMPLER.backend,
+        # What this is running on. The dashboard shows it because the same image and the same UI
+        # now serve a Jetson and an x86 box, and which one you are looking at is not otherwise
+        # visible from the numbers.
+        "platform": SAMPLER.platform,
+        "device": SAMPLER.device,
+        "arch": SAMPLER.arch,
         "error": SAMPLER.error,
     }
 

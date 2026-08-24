@@ -238,10 +238,15 @@ Environment, read by `docker/compose.yml`:
 | `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
 | `ISMS_RTSP_URLS` | comma-separated per-camera URLs; position is the camera id |
 | `ISMS_WIPE` | wipe previous incidents on start, default 1 |
+| `ISMS_RGB_CAPTURE` | subject crops; unset follows the source mode — on for `rtsp`, off for `file` |
 | `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` |
 
 Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
 committed — the same reason `HF_TOKEN` lives in `.env`.
+
+Subject crops need CUDA torch in the image, ~3.5 GB; `--build-arg WITH_RGB_CAPTURE=0` leaves it
+out and the VLM falls back to context frames. Only RTSP needs it — in file mode the crop is cut
+from the source `.mp4` at the incident PTS.
 
 `docker compose --profile sources up -d sources` publishes the demo media as 20 RTSP cameras on
 `:8654`, for exercising the live path on a single box. `scripts/serve_rtsp_sources.sh` describes

@@ -59,6 +59,8 @@ services:
       ISMS_WAIT_VLM_S: "${ISMS_WAIT_VLM_S:-2400}"
       # Camera addresses come from the environment, never from the committed config: real URLs
       # carry credentials, and the same image runs against a different fleet at every site.
+      # Subject crops. Unset lets the API follow the source mode: on for rtsp, off for file.
+      ISMS_RGB_CAPTURE: "${ISMS_RGB_CAPTURE:-}"
       ISMS_RTSP_BASE: "${ISMS_RTSP_BASE:-}"
       ISMS_RTSP_URLS: "${ISMS_RTSP_URLS:-}"
 

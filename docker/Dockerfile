@@ -108,6 +108,21 @@ RUN pip install --no-cache-dir --break-system-packages \
 
 WORKDIR ${ISMS_ROOT}
 
+# Subject crops (`--rgb-capture`). The pipeline pulls the violating subject out of the live frame
+# via Buffer.extract() -> DLPack -> torch, so torch has to be CUDA-enabled and in SYSTEM python,
+# beside pyservicemaker. ~3.5 GB, hence the switch: --build-arg WITH_RGB_CAPTURE=0 leaves it out
+# and the VLM falls back to context frames.
+#
+# Only RTSP mode needs it. In file mode the crop is cut from the source .mp4 at the incident PTS
+# and no torch is involved.
+ARG WITH_RGB_CAPTURE=1
+RUN if [ "$WITH_RGB_CAPTURE" = "1" ]; then \
+        pip install --no-cache-dir --break-system-packages \
+            torch --index-url https://download.pytorch.org/whl/cu126 \
+        && pip install --no-cache-dir --break-system-packages opencv-python-headless \
+        && python3 -c "import torch, cv2; from torch.utils.dlpack import from_dlpack" ; \
+    fi
+
 # Services venv, kept out of system python for the reason above. Copied first so a source edit
 # does not invalidate the dependency layer.
 COPY requirements/ requirements/
