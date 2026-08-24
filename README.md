@@ -246,7 +246,22 @@ That re-encodes whatever it finds into the 20-camera set, hardware-encoded throu
 With `media/src/` empty it falls back to the H.265 sample DeepStream ships, which contains no
 helmets, vests or fire — it satisfies the decode benchmark and nothing else.
 
-### 4. Bring it up
+### 4. Credentials, if you want them — optional
+
+Nothing here needs a token. The model weights come from public GGUF repositories and download
+anonymously; `HF_TOKEN` is only for a gated repository, and Telegram alerts are off by default.
+
+If you do want either, the file has to exist **before** the containers are created:
+
+```bash
+cp .env.example .env && chmod 600 .env
+$EDITOR .env
+```
+
+`env_file` is read at container *creation*, so a `.env` written afterwards needs
+`up -d --force-recreate app` — `restart` keeps the environment the container was built with.
+
+### 5. Bring it up
 
 ```bash
 docker compose -f docker/compose.yml up -d --build
@@ -268,7 +283,7 @@ docker compose -f docker/compose.yml logs -f app    # engine build, then the pip
 docker compose -f docker/compose.yml down           # stop; volumes survive
 ```
 
-### 5. Live cameras
+### 6. Live cameras
 
 Point it at real RTSP cameras, one URL per camera, position being the camera id:
 
@@ -362,6 +377,12 @@ The same file, the same place, on both platforms. On Jetson `scripts/env.sh` sou
 `docker/compose.yml` reads it into the containers that need it. It is optional in both cases —
 without it the features that need a token stay off. The image itself ships no `.env`, so nothing
 in it can overwrite yours.
+
+On x86 the reasoning layer needs no token at all: it serves quantised GGUF builds
+(`robertzty/Cosmos-Reason2-2B-GGUF`, `bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`), both
+public, and `hf_hub_download` is called with no token when the variable is unset. The 11 GB pull
+on this deployment ran anonymously. `HF_TOKEN` matters for the Jetson path, which can fetch
+`nvidia/Cosmos-Reason2-2B` itself, and that repository is gated.
 
 ### Hugging Face token
 
