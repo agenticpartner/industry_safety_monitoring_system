@@ -261,18 +261,81 @@ $EDITOR .env
 `env_file` is read at container *creation*, so a `.env` written afterwards needs
 `up -d --force-recreate app` — `restart` keeps the environment the container was built with.
 
-### 5. Bring it up
+### 5. Run it — three modes
+
+Pick one. They differ only in where the video comes from; everything downstream — detection,
+tracking, zones, incidents, the VLM, the dashboard — is identical.
+
+| | source | evidence clips | use |
+|---|---|---|---|
+| **A** | files in `media/` | cut from the `.mp4` with `ffmpeg -c copy` | demos, benchmarks, repeatable numbers |
+| **B** | those same files, served as RTSP | `nvurisrcbin` smart record | exercising the live path with no cameras |
+| **C** | real cameras | `nvurisrcbin` smart record | production |
+
+#### A. Video files — the default
 
 ```bash
 docker compose -f docker/compose.yml up -d --build
 ```
 
-Then `http://<host>:8080/`. That runs **20 file sources from `media/`** — see
-[Configuration](#configuration) for the RTSP path and `docker/.env`.
+20 file sources from `media/`, run flat out. This is the mode to benchmark in: no network, no
+external host, repeatable.
+
+#### B. The same files, served as RTSP
+
+Publishes `media/` as 20 RTSP cameras on `:8654`, then points the pipeline at them:
+
+```bash
+ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
+  docker compose -f docker/compose.yml --profile sources up -d
+```
+
+This is the only way to exercise the live path — reconnection, TCP transport, smart-record
+evidence clips, subject crops — without cameras. The restreamers burn CPU beside the inference
+they feed, so throughput measured here describes a box doing both jobs;
+`scripts/serve_rtsp_sources.sh` explains why that is not a deployment topology.
+
+Sources are real-time paced, so 20 cameras at `drop_frame_interval: 2` produce 300 fps of
+analytics and the pipeline keeping pace at ~300 fps is the expected result, not a ceiling.
+
+#### C. Real cameras
+
+One URL per camera. **Position in the list is the camera id** that zones, the OSD label, the clip
+prefixes and the dashboard all key on:
+
+```bash
+ISMS_SOURCE=rtsp \
+ISMS_RTSP_URLS="rtsp://user:pw@10.0.0.11/Streaming/Channels/101,rtsp://user:pw@10.0.0.12/axis-media/media.amp" \
+  docker compose -f docker/compose.yml up -d
+```
+
+A fleet on one server with numbered mounts can use `ISMS_RTSP_BASE=rtsp://10.0.0.5:8554` instead,
+which fills in `cam01 … camNN` from `sources.rtsp_pattern`.
+
+Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
+committed — the same reason `HF_TOKEN` lives in `.env`.
+
+#### Making a mode stick
+
+The commands above set the mode for one invocation. To make it the default for this deployment,
+put the same names in `docker/.env` (see `docker/.env.example`) and plain `docker compose up -d`
+uses them:
+
+```ini
+ISMS_SOURCE=rtsp
+ISMS_RTSP_BASE=rtsp://127.0.0.1:8654
+```
+
+Switching modes later means recreating the app container, not restarting it:
+
+```bash
+ISMS_SOURCE=file docker compose -f docker/compose.yml up -d --force-recreate app
+```
+
+### First boot, and watching it
 
 First boot builds the TensorRT engines against the GPU that is present (~8 minutes) and pulls
-~11 GB of model weights. Both land on named volumes, so every later start skips them. Nothing is
-run by hand.
+~11 GB of model weights. Both land on named volumes, so every later start skips them.
 
 The reasoning containers are slow to arrive and nothing waits for them: the dashboard and the
 pipeline come up immediately, and the reasoning layer joins when the VLM answers. Until then
@@ -281,31 +344,9 @@ incidents read `unverified`.
 ```bash
 curl -s localhost:8080/health                       # every component, one line
 docker compose -f docker/compose.yml logs -f app    # engine build, then the pipeline
-docker compose -f docker/compose.yml down           # stop; volumes survive
+docker compose -f docker/compose.yml --profile sources down   # stop; volumes survive
 ```
 
-### 6. Live cameras
-
-Point it at real RTSP cameras, one URL per camera, position being the camera id:
-
-```bash
-ISMS_SOURCE=rtsp \
-ISMS_RTSP_URLS="rtsp://user:pw@10.0.0.11/Streaming/Channels/101,rtsp://user:pw@10.0.0.12/axis-media/media.amp" \
-  docker compose -f docker/compose.yml up -d app
-```
-
-Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
-committed — the same reason `HF_TOKEN` lives in `.env`.
-
-Without cameras, `--profile sources` republishes the demo media as 20 RTSP streams on `:8654` so
-the live path can be exercised on one box. `scripts/serve_rtsp_sources.sh` describes why that is
-not a deployment topology, and any throughput measured that way is a box doing both jobs.
-
-```bash
-docker compose -f docker/compose.yml --profile sources up -d sources
-ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
-  docker compose -f docker/compose.yml up -d app
-```
 
 ### What runs
 
