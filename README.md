@@ -358,6 +358,11 @@ chmod 600 .env
 
 `.env` is gitignored and must stay that way.
 
+The same file, the same place, on both platforms. On Jetson `scripts/env.sh` sources it; on x86
+`docker/compose.yml` reads it into the containers that need it. It is optional in both cases —
+without it the features that need a token stay off. The image itself ships no `.env`, so nothing
+in it can overwrite yours.
+
 ### Hugging Face token
 
 Needed only for the optional reasoning layer, which downloads the vision and language model

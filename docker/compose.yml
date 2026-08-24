@@ -48,6 +48,13 @@ services:
         condition: service_healthy
     gpus: all
 
+    # The same .env at the repo root that the Jetson reads, so the credentials step is identical
+    # on both platforms: copy .env.example to .env and fill it in. Optional — without it the
+    # features that need a token stay off, which is what an empty .env does on the Jetson too.
+    env_file:
+      - path: ../.env
+        required: false
+
     environment:
       ISMS_STREAMS: "${ISMS_STREAMS:-20}"
       ISMS_SOURCE: "${ISMS_SOURCE:-file}"
@@ -104,6 +111,12 @@ services:
     network_mode: host
     restart: unless-stopped
     gpus: all
+    # The same .env at the repo root that the Jetson reads, so the credentials step is identical
+    # on both platforms: copy .env.example to .env and fill it in. Optional — without it the
+    # features that need a token stay off, which is what an empty .env does on the Jetson too.
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       ROLE: vlm
       PORT: "8000"
@@ -132,6 +145,12 @@ services:
     network_mode: host
     restart: unless-stopped
     gpus: all
+    # The same .env at the repo root that the Jetson reads, so the credentials step is identical
+    # on both platforms: copy .env.example to .env and fill it in. Optional — without it the
+    # features that need a token stay off, which is what an empty .env does on the Jetson too.
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       ROLE: llm
       PORT: "8001"

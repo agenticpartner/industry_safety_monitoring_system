@@ -167,8 +167,10 @@ RUN make -C models/parser \
 # tracks the image, engines stay where the build left them.
 RUN cp -a models /opt/isms/models.dist
 
-RUN mkdir -p data logs media build \
-    && cp .env.example .env && chmod 600 .env
+# Deliberately no .env. scripts/env.sh's load_env() sources it and would overwrite the operator's
+# credentials with this file's empty ones — an image that ships `TELEGRAM_BOT_TOKEN=` clobbers a
+# real token injected through the environment. Absent, load_env leaves what compose set alone.
+RUN mkdir -p data logs media build
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
