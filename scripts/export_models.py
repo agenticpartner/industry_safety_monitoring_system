@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Runs ON THE JETSON inside build/venv-export.
+Runs inside build/venv-export on the Jetson, and as the ONNX export stage of docker/Dockerfile
+on x86. ONNX is architecture-independent, which is why this step is the one part of the model
+pipeline that can be baked into an image; the TensorRT engines cannot be.
 
 Downloads the PPE and fire/smoke YOLO checkpoints, exports each to ONNX, and reports the two
 facts that determine everything downstream:
@@ -16,6 +18,7 @@ the single most common way a DeepStream YOLO integration silently produces zero 
 
     ./build/venv-export/bin/python3 scripts/export_models.py [ppe|fire|all]
 """
+
 import json
 import shutil
 import subprocess
@@ -56,7 +59,23 @@ def download(repo: str, fname: str, dst: Path) -> Path:
 
 
 def export(name: str, spec: dict) -> dict:
+    import torch
     from ultralytics import YOLO
+
+    # oneDNN is disabled for the whole export, which costs nothing and prevents a hard crash.
+    #
+    # On an AMD EPYC 9554 (Zen 4) with torch 2.13.0+cpu, a plain `nn.Conv2d` over a
+    # (20, 3, 640, 640) tensor dies with SIGFPE inside `_conv_forward` — no Python traceback, just
+    # "Floating point exception (core dumped)" and exit 136. Reduced to four lines of torch with no
+    # ultralytics involved, so it is a oneDNN convolution bug and not anything in this file. It
+    # surfaced first in the FLOPs counter that `fuse()` calls, which made it look like a
+    # bookkeeping problem; the real export hits the same kernel a moment later.
+    #
+    # This changes which convolution implementation runs, never what is traced: the ONNX graph is
+    # a record of the operations, not of their numerics, so the exported file is byte-identical
+    # either way. TensorRT does every real inference, and the reference kernels are quick enough
+    # for two nano-scale models exported once at image build time.
+    torch.backends.mkldnn.enabled = False
 
     print(f"\n=== {name} — {spec['repo']} ===")
     print(f"    {spec['note']}")

@@ -1,0 +1,73 @@
+# x86_64 dGPU deployment.
+#
+#   docker compose -f docker/compose.yml up --build -d
+#   docker compose -f docker/compose.yml logs -f app
+#   docker compose -f docker/compose.yml down
+#
+# Then http://<host>:8080/
+#
+# `network_mode: host` throughout, which is a decision rather than a shortcut: configs/services.yml
+# addresses redis at 127.0.0.1:6379 and the pipeline publishes to rtsp://127.0.0.1:8554, and those
+# files are the Jetson's too. Bridge networking would mean editing shared config to carry a
+# container-only hostname. Host networking keeps one set of configs correct on both platforms, and
+# on a single-purpose GPU appliance there is nothing to isolate it from.
+
+name: isms
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    network_mode: host
+    restart: unless-stopped
+    # The event bus between the pipeline and the services. Persistence is off on purpose: the
+    # stream is bounded to 100k entries (services.yml) and SQLite is the durable store — an RDB
+    # dump would duplicate it and stall the writer at exactly the wrong moment.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: isms:x86
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    gpus: all
+
+    environment:
+      ISMS_STREAMS: "${ISMS_STREAMS:-20}"
+      ISMS_SOURCE: "${ISMS_SOURCE:-file}"
+      ISMS_AUTOSTART: "${ISMS_AUTOSTART:-1}"
+      ISMS_WIPE: "${ISMS_WIPE:-1}"
+      ISMS_ENGINE_BATCH: "${ISMS_ENGINE_BATCH:-20}"
+
+    volumes:
+      # Footage. Read-only: the pipeline decodes it and clip_service cuts from it with
+      # `ffmpeg -c copy`, and neither has any reason to write back.
+      - ../media:/opt/isms/media:ro
+      # Engines live here. A named volume so the ~10 minute build survives a container replace;
+      # the entrypoint stamps them with the GPU that built them and rebuilds on a mismatch.
+      - models:/opt/isms/models
+      # Incident database and evidence clips.
+      - data:/opt/isms/data
+      - logs:/opt/isms/logs
+
+    # DeepStream's buffer pools live in shared memory; the 64 MB default is not enough for twenty
+    # 1080p streams through a muxer, a tiler and an OSD.
+    shm_size: "2gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+volumes:
+  models:
+  data:
+  logs:

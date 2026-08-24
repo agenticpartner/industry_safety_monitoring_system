@@ -1,0 +1,40 @@
+# The build context is the repo. Everything here is either reproducible inside the image, far
+# too large to send, or must never enter one.
+
+# Credentials. The same line that matters most in .gitignore.
+.env
+*.env.local
+auto.crt
+auto.key
+
+# 454 MB of generated H.265. Media is mounted at runtime, never baked: the image must not carry
+# one site's footage to another site's deployment.
+media/*
+!media/.gitkeep
+
+# Model artifacts. ONNX is produced by the export stage, engines are built on first boot against
+# the GPU that is actually present — an engine baked here would be wrong on every other machine.
+*.onnx
+*.pt
+*.engine
+*.so
+*.gguf
+*.safetensors
+*.timing.cache
+
+# Host build products and runtime state.
+build/
+data/
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.py[cod]
+
+# History, docs images and benchmark detritus — none of it runs.
+.git/
+.claude/
+docs/images/
+bench/sweep_*/
+bench/engines/
+bench/*.log
+.DS_Store
