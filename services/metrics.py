@@ -73,12 +73,13 @@ RE_POWER = re.compile(r"(VDD_\w+|VIN_\w+) (\d+)mW")
 
 
 def is_jetson() -> bool:
-    """Tegra is identified by the device tree, never by the architecture alone.
+    """Tegra is identified by the L4T stamp, never by the architecture or a device-tree file.
 
-    `platform.machine() == "aarch64"` is also every ARM server and every Apple VM, and one of
-    those with a discrete card must take the nvidia-smi path.
+    `platform.machine() == "aarch64"` is also DGX Spark, Grace, and every Apple VM, and those
+    boards expose `/proc/device-tree/model` too. Only `/etc/nv_tegra_release` means Jetson —
+    Spark must take the nvidia-smi path.
     """
-    return os.path.exists("/etc/nv_tegra_release") or os.path.exists("/proc/device-tree/model")
+    return os.path.exists("/etc/nv_tegra_release")
 
 
 def device_label() -> tuple[str, str]:
@@ -102,7 +103,11 @@ def device_label() -> tuple[str, str]:
                              capture_output=True, text=True, timeout=10)
         name = (out.stdout or "").strip().splitlines()
         if name and name[0].strip():
-            return "dgpu", name[0].strip()
+            gpu = name[0].strip()
+            machine = os.uname().machine if hasattr(os, "uname") else ""
+            if machine == "aarch64":
+                return "sbsa", gpu
+            return "dgpu", gpu
     except (OSError, subprocess.SubprocessError):
         pass
     return "dgpu", "discrete NVIDIA GPU"
@@ -355,6 +360,10 @@ class NvSmiSampler(_BaseSampler):
 
         cpu_mean, cpu_max = self._cpu.read()
         sys_used, sys_total = _host_ram_mb()
+        # On DGX Spark, nvidia-smi memory.used/total is often "[N/A]" because the pool is
+        # unified with system RAM — fall back to host RAM rather than reporting 0 MB.
+        ram_used = used if used is not None else sys_used
+        ram_total = total if total else sys_total
 
         return {
             "t": time.time(),
@@ -371,9 +380,9 @@ class NvSmiSampler(_BaseSampler):
             # an idle block that does not exist.
             "vic": None,
             # VRAM: the memory the GPU draws from. See the module docstring.
-            "ram": round(100 * used / total) if used is not None and total else 0,
-            "ram_used_mb": used,
-            "ram_total_mb": total,
+            "ram": round(100 * ram_used / ram_total) if ram_used is not None and ram_total else 0,
+            "ram_used_mb": ram_used,
+            "ram_total_mb": ram_total,
             "sys_ram": round(100 * sys_used / sys_total) if sys_used is not None and sys_total else None,
             "sys_ram_used_mb": sys_used,
             "sys_ram_total_mb": sys_total,

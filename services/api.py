@@ -121,6 +121,60 @@ def _arg_value(args: list[str], flag: str) -> str | None:
     return None
 
 
+LAST_PIPELINE_PATH = ROOT / "data" / "pipeline_last.json"
+
+
+def _load_last_pipeline() -> dict | None:
+    try:
+        return json.loads(LAST_PIPELINE_PATH.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _save_last_pipeline(snap: dict) -> None:
+    try:
+        LAST_PIPELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_PIPELINE_PATH.write_text(json.dumps(snap))
+    except OSError:
+        pass
+
+
+def _snapshot_running_pipeline() -> dict | None:
+    """How the live process was started, so Pause → Resume comes back the same way."""
+    args = _proc_args("safety_pipeline.py")
+    if not args:
+        return _load_last_pipeline()
+    cfg = DEMO["pipeline"]
+    dfi_arg = _arg_value(args, "--drop-frame-interval")
+    dfi = int(dfi_arg) if dfi_arg is not None else int(cfg.get("drop_frame_interval", 0) or 0)
+    return {
+        "streams": int(_arg_value(args, "--streams") or cfg["streams"]),
+        "source": _arg_value(args, "--source") or cfg["source_mode"],
+        "drop_frame_interval": dfi,
+        "rtsp_out": "--rtsp-out" in args,
+        "rgb_capture": "--rgb-capture" in args,
+        "zones": "--zones" in args,
+        "events": "--events" in args,
+    }
+
+
+def _env_pipeline_defaults() -> dict:
+    """Compose/entrypoint values beat demo.yml: Spark runs 20 RTSP, not the committed 1-file demo."""
+    src = os.environ.get("ISMS_SOURCE") or DEMO["pipeline"]["source_mode"]
+    try:
+        n = int(os.environ.get("ISMS_STREAMS") or DEMO["pipeline"]["streams"])
+    except (TypeError, ValueError):
+        n = int(DEMO["pipeline"]["streams"])
+    rgb_env = os.environ.get("ISMS_RGB_CAPTURE", "")
+    if rgb_env in ("0", "false", "False"):
+        rgb = False
+    elif rgb_env in ("1", "true", "True"):
+        rgb = True
+    else:
+        rgb = None
+    return {"streams": n, "source": src, "rgb_capture": rgb}
+
+
 # ---------------------------------------------------------------------------------------------
 # health / status
 # ---------------------------------------------------------------------------------------------
@@ -179,6 +233,8 @@ def pipeline_status():
     dfi = int(dfi_arg) if dfi_arg is not None else cfg_dfi
     fps = (30 // dfi) if dfi > 1 else 30
 
+    rgb_capture = ("--rgb-capture" in args) if pids else None
+    last = _load_last_pipeline()
     return {
         "running": bool(pids), "pids": pids,
         "streams": streams,
@@ -190,6 +246,8 @@ def pipeline_status():
             ROOT / "configs/analytics/analytics.txt").exists(),
         "events": ("--events" in args) if pids else None,
         "rtsp_out": ("--rtsp-out" in args) if pids else False,
+        "rgb_capture": rgb_capture,
+        "last_run": last,
         "configured": {"streams": cfg_streams, "drop_frame_interval": cfg_dfi},
         "config_differs": bool(pids) and (streams != cfg_streams or dfi != cfg_dfi),
     }
@@ -197,8 +255,13 @@ def pipeline_status():
 
 @app.post("/pipeline/start", tags=["pipeline"])
 def pipeline_start(streams: int = Query(None, ge=1, le=20), source: str = Query(None),
-                   rtsp_out: bool = Query(False), rgb_capture: bool = Query(None)):
+                   rtsp_out: bool = Query(None), rgb_capture: bool = Query(None),
+                   drop_frame_interval: int = Query(None, ge=0, le=30)):
     """Start the pipeline detached. Refuses if one is already running.
+
+    Omitted arguments fall back to the last Pause snapshot, then the process environment
+    (`ISMS_STREAMS` / `ISMS_SOURCE` / `ISMS_RGB_CAPTURE`), then demo.yml. Resume must come back
+    as the same 20-camera RTSP graph this host was running, not the committed 1-file demo.
 
     `rtsp_out` adds the encode branch that publishes the tiled wall to mediamtx. It is a start-time
     flag rather than a toggle because the branch is part of the pipeline graph — there is no way to
@@ -207,18 +270,29 @@ def pipeline_start(streams: int = Query(None, ge=1, le=20), source: str = Query(
     """
     if _proc_running("safety_pipeline.py"):
         raise HTTPException(409, "pipeline already running — stop it first")
-    args = ["python3", "app/safety_pipeline.py",
-            "--source", source or DEMO["pipeline"]["source_mode"],
-            "--streams", str(streams or DEMO["pipeline"]["streams"]),
-            "--no-display", "--zones", "--events", "--fps", "--stats"]
-    if rtsp_out:
-        args.append("--rtsp-out")
-    # Subject crops. Defaults to on for RTSP and off for file: over RTSP there is no source file
-    # to cut a crop from, so this branch is the only way to get one, while in file mode the crop
-    # comes out of the .mp4 at the incident PTS and the branch would be pure cost.
+    last = _load_last_pipeline() or {}
+    env = _env_pipeline_defaults()
+    src = source or last.get("source") or env["source"]
+    n = streams or last.get("streams") or env["streams"]
+    dfi = drop_frame_interval
+    if dfi is None:
+        dfi = last.get("drop_frame_interval")
+    want_rtsp = rtsp_out if rtsp_out is not None else bool(last.get("rtsp_out", True))
     want_crop = rgb_capture
+    if want_crop is None and "rgb_capture" in last:
+        want_crop = bool(last.get("rgb_capture"))
     if want_crop is None:
-        want_crop = (source or DEMO["pipeline"]["source_mode"]) == "rtsp"
+        want_crop = env["rgb_capture"]
+    if want_crop is None:
+        want_crop = src == "rtsp"
+    args = ["python3", "app/safety_pipeline.py",
+            "--source", src,
+            "--streams", str(n),
+            "--no-display", "--zones", "--events", "--fps", "--stats"]
+    if dfi is not None:
+        args.extend(["--drop-frame-interval", str(int(dfi))])
+    if want_rtsp:
+        args.append("--rtsp-out")
     if want_crop:
         args.append("--rgb-capture")
     log = ROOT / "logs/pipeline_api.log"
@@ -226,8 +300,12 @@ def pipeline_start(streams: int = Query(None, ge=1, le=20), source: str = Query(
     with open(log, "wb") as fh:
         subprocess.Popen(args, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, start_new_session=True)
+    snap = {"streams": int(n), "source": src, "drop_frame_interval": dfi,
+            "rtsp_out": want_rtsp, "rgb_capture": want_crop, "zones": True, "events": True}
+    _save_last_pipeline(snap)
     time.sleep(2)
-    return {"started": True, "pids": _proc_running("safety_pipeline.py"), "log": str(log)}
+    return {"started": True, "pids": _proc_running("safety_pipeline.py"),
+            "log": str(log), "run": snap}
 
 
 @app.post("/pipeline/stop", tags=["pipeline"])
@@ -235,15 +313,19 @@ def pipeline_stop():
     """Stop with SIGKILL, not SIGTERM.
 
     `pipeline.wait()` blocks inside C++ so SIGINT/SIGTERM are ignored — see project_skill.md.
-    The pipeline has no state to flush, so killing it is safe.
+    The pipeline has no state to flush, so killing it is safe. TensorRT engines unload with the
+    process, which is what frees the GPU for everything else.
     """
+    snap = _snapshot_running_pipeline()
+    if snap:
+        _save_last_pipeline(snap)
     pids = _proc_running("safety_pipeline.py")
     for pid in pids:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    return {"stopped": pids}
+    return {"stopped": pids, "last_run": snap}
 
 
 @app.patch("/pipeline/config", tags=["pipeline"])
@@ -888,6 +970,99 @@ def metrics_system(minutes: float = Query(5.0, ge=0.1, le=60),
     }
 
 
+def _redis_xlen() -> int | None:
+    """Length of the incident stream. None if Redis is down — the flow page must still render."""
+    try:
+        import redis as redis_lib
+        rc = CFG["events"]["redis"]
+        r = redis_lib.Redis(host=rc["host"], port=int(rc["port"]),
+                            socket_connect_timeout=0.25, socket_timeout=0.25)
+        try:
+            return int(r.xlen(rc["stream"]))
+        finally:
+            r.close()
+    except Exception:
+        return None
+
+
+@app.get("/metrics/flow", tags=["metrics"])
+def metrics_flow():
+    """Live snapshot for the /flow page: what is moving, not one particle per frame.
+
+    The hot path is inferred from process liveness (the pipeline does not emit per-batch
+    counters). Incidents, clip queue and VLM queue are real SQLite rows. Redis XLEN is the
+    bus depth. The page is honest about that split — gold trickle means inference is running,
+    coloured particles are actual incidents and verdicts.
+    """
+    pipe = pipeline_status()
+    now = time.time()
+    since = now - 90.0
+    recent: list[dict] = []
+    clip_pending = clip_recording = vlm_waiting = incidents = incidents_90s = 0
+    if DB_PATH.exists():
+        try:
+            with db_ro() as c:
+                recent = [dict(r) for r in c.execute(
+                    "SELECT event_id, ts, camera_id, type, severity, state, "
+                    "vlm_verdict, clip_state FROM events ORDER BY ts DESC LIMIT 40"
+                ).fetchall()]
+                row = c.execute(
+                    "SELECT "
+                    "  COALESCE(SUM(CASE WHEN clip_state IN ('pending','recording') "
+                    "                    THEN 1 ELSE 0 END), 0), "
+                    "  COALESCE(SUM(CASE WHEN clip_state = 'recording' THEN 1 ELSE 0 END), 0), "
+                    "  COALESCE(SUM(CASE WHEN clip_state = 'ready' AND "
+                    "                    (vlm_verdict IS NULL OR vlm_verdict = 'unverified') "
+                    "                    THEN 1 ELSE 0 END), 0), "
+                    "  COUNT(*), "
+                    "  COALESCE(SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END), 0) "
+                    "FROM events",
+                    (since,),
+                ).fetchone()
+                clip_pending, clip_recording, vlm_waiting, incidents, incidents_90s = (
+                    int(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]))
+        except sqlite3.Error:
+            pass
+    cur = SAMPLER.current() or {}
+    return {
+        "ts": now,
+        "pipeline": pipe["running"],
+        "streams": pipe["streams"],
+        "source_mode": pipe["source_mode"],
+        "realtime_target_fps": pipe["realtime_target_fps"],
+        "event_service": bool(_proc_running("event_service.py")),
+        "clip_service": bool(_proc_running("clip_service.py")),
+        "reasoning_service": bool(_proc_running("reasoning_service.py")),
+        "redis_len": _redis_xlen(),
+        "gpu": cur.get("gpu"),
+        "nvdec": cur.get("nvdec"),
+        "incidents": incidents,
+        "incidents_90s": incidents_90s,
+        "clip_pending": clip_pending,
+        "clip_recording": clip_recording,
+        "vlm_waiting": vlm_waiting,
+        "recent": [{
+            "id": r["event_id"],
+            "ts": r["ts"],
+            "camera_id": r["camera_id"],
+            "type": r["type"],
+            "severity": r["severity"],
+            "state": r["state"],
+            "vlm_verdict": r.get("vlm_verdict") or "unverified",
+            "clip_state": r.get("clip_state"),
+        } for r in recent],
+    }
+
+
+@app.get("/flow", response_class=HTMLResponse, include_in_schema=False)
+def flow_page():
+    """Live particle view of work moving through the pipeline. Not the /system reference."""
+    page = ROOT / "dashboard/flow.html"
+    if not page.exists():
+        raise HTTPException(404, "flow page not found")
+    return HTMLResponse(page.read_text())
+
+
 @app.get("/system", response_class=HTMLResponse, include_in_schema=False)
 def system_page():
     """Developer reference: models, engines, measured throughput and latency, wiring.
@@ -918,7 +1093,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("ISMS_API_PORT", "8080")))
     a = ap.parse_args()
     if (ROOT / "dashboard").exists():
         app.mount("/static", StaticFiles(directory=ROOT / "dashboard"), name="static")

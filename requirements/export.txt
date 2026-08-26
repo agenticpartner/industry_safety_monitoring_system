@@ -7,3 +7,7 @@ ultralytics>=8.3
 onnx>=1.16
 onnxslim
 onnxruntime
+# Hub client follows LFS/Xet redirects and resumes. urllib against /resolve/main/ has
+# truncated the fire checkpoint mid-file (9.6 MB of 20.3 MB), which then fails as a
+# "corrupted" zip when YOLO loads it.
+huggingface_hub>=0.30

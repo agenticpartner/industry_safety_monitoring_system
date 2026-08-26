@@ -23,6 +23,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
+bash scripts/ensure_blackwell_nvinfer.sh || true
+STRONGLY_TYPED=0
+_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)"
+_GPU="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+case "$_CAP" in 12.*|13.*) STRONGLY_TYPED=1 ;; esac
+printf '%s\n' "$_GPU" | grep -Eqi 'GB10|GB200|GB300|B200|B300|Blackwell|DGX Spark' && STRONGLY_TYPED=1
+unset _CAP _GPU
+
 WHICH="${1:-all}"
 BATCH="${2:-$MAX_STREAMS}"
 read -r -a PRECISIONS <<< "${3:-fp16}"
@@ -60,6 +68,9 @@ for M in "${MODELS[@]}"; do
            --useCudaGraph
            --avgRuns=50 --duration=15)
     if [ "$PREC" = fp16 ]; then FLAGS+=(--fp16); else FLAGS+=(--int8 --fp16); fi
+    # Blackwell/GB10: without this, TensorRT can serialize an engine that loads and then
+    # emits zero detections. Same flag nvinfer gets via strongly-typed: 1 in the YAML.
+    [ "$STRONGLY_TYPED" = 1 ] && FLAGS+=(--stronglyTyped)
 
     echo "==> building ${PREC}"
     s=$(date +%s)

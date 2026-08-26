@@ -18,7 +18,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-API=http://127.0.0.1:8080
+API_PORT="${ISMS_API_PORT:-8080}"
+API="http://127.0.0.1:${API_PORT}"
 
 # ---- down ----------------------------------------------------------------------------------
 if [ "${1:-}" = "--down" ]; then
@@ -94,8 +95,8 @@ for _ip in $(hostname -I 2>/dev/null); do
   case "$_ip" in
     127.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|*:*) continue ;;   # loopback, docker, IPv6
   esac
-  echo "      http://${_ip}:8080/"
+  echo "      http://${_ip}:${API_PORT}/"
 done
-echo "      http://$(hostname):8080/   (only if this name resolves from the viewer)"
+echo "      http://$(hostname):${API_PORT}/   (only if this name resolves from the viewer)"
 echo "    A clip takes 2-3 s to cut and the VLM adjudicates at ~6 s each, serially —"
 echo "    a cold start burst takes a few minutes to fully verify. Alerts appear in <1 s."

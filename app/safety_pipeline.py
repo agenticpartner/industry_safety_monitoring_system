@@ -42,7 +42,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import platform
 import queue
 import sys
 import threading
@@ -1427,7 +1426,9 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
         want_display = False
     want_rtsp = cfg["sinks"]["rtsp_out"].get("enabled", False) or args.rtsp_out
 
-    sink_type = "nv3dsink" if platform.processor() == "aarch64" else "nveglglessink"
+    # nv3dsink is Tegra. DGX Spark is aarch64 but SBSA/dGPU-class — nveglglessink, same as x86.
+    # Do not key this on architecture: `platform.processor()` is often empty on Linux aarch64.
+    sink_type = "nv3dsink" if os.path.exists("/etc/nv_tegra_release") else "nveglglessink"
     # async=0 everywhere: with a tee in the graph, a sink left on async=1 parks the pipeline in
     # PAUSED forever with no error. Set unconditionally so toggling sinks can't reintroduce it.
     common = {"sync": 0, "qos": 0, "async": 0}

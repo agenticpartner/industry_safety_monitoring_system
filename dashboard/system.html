@@ -45,8 +45,9 @@
   }
   h1 { font-size:17px; margin:0; letter-spacing:-.01em; font-weight:650; }
   h1 em { font-style:normal; color:var(--accent); }
+  .hdr-links { margin-left:auto; display:flex; gap:8px; }
   .back {
-    margin-left:auto; font-size:12px; color:var(--text-2); text-decoration:none;
+    font-size:12px; color:var(--text-2); text-decoration:none;
     border:1px solid var(--border-2); border-radius:9px; padding:6px 12px; background:var(--surface-2);
   }
   .back:hover { border-color:var(--accent); color:var(--text-1); }
@@ -101,7 +102,10 @@
 <header>
   <h1>🧠 System <em>Reference</em></h1>
   <span class="tag">measured on this device</span>
-  <a class="back" href="/">← back to dashboard</a>
+  <div class="hdr-links">
+    <a class="back" href="/flow">◎ live flow</a>
+    <a class="back" href="/">← back to dashboard</a>
+  </div>
 </header>
 
 <main>
@@ -252,6 +256,8 @@
       fire-and-forget to Redis and never blocks the graph. Measured cost of publishing at 20
       streams: <b>−0.9%</b> (514.2 → 509.6 fps), zero drops. The queue is bounded and drops
       oldest-first, so an unavailable consumer cannot slow or stall the graph.
+      To watch live work move along these edges, open <a href="/flow">/flow</a> — this page
+      stays a measured reference.
     </div>
   </section>
 

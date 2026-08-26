@@ -1,6 +1,8 @@
-# x86_64 dGPU image for the safety monitoring pipeline.
+# x86_64 dGPU / ARM SBSA (DGX Spark) image for the safety monitoring pipeline.
 #
 #   docker compose -f docker/compose.yml up --build
+#   # DGX Spark / GB10:
+#   docker compose -f docker/compose.yml -f docker/compose.spark.yml up --build
 #
 # The Jetson build installs onto the host with scripts/setup.sh. This image does the same work in
 # layers, with three things deliberately NOT baked in:
@@ -13,6 +15,11 @@
 #
 # ONNX *is* baked, in a separate stage below: it is architecture-independent, and exporting it
 # needs torch + ultralytics, ~2.5 GB that has no business in a runtime image.
+
+# Default is the x86/Jetson multiarch samples image. DGX Spark must override this to
+# nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark — the Tegra multiarch image is a different
+# ARM ABI and fails on GB10 with missing libnvbufsurface.
+ARG DS_IMAGE=nvcr.io/nvidia/deepstream:9.1-samples-multiarch
 
 # =================================================================================================
 # Stage 1 — detector weights -> ONNX
@@ -47,10 +54,11 @@ RUN python3 scripts/export_models.py all
 # =================================================================================================
 # Stage 2 — runtime
 # =================================================================================================
-# `samples` rather than `triton`: project_skill.md §4 settles nvinfer over nvinferserver, so the
-# Triton server is dead weight. Verified on this image: the pyservicemaker wheel, trtexec, g++ and
-# the DeepStream headers the custom parser needs are all present.
-FROM nvcr.io/nvidia/deepstream:9.1-samples-multiarch
+# `samples` rather than `triton` on x86: project_skill.md §4 settles nvinfer over nvinferserver,
+# so the Triton server is dead weight. Verified on this image: the pyservicemaker wheel, trtexec,
+# g++ and the DeepStream headers the custom parser needs are all present.
+# On DGX Spark the only published runtime is the SBSA Triton image; compose.spark.yml selects it.
+FROM ${DS_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ISMS_ROOT=/opt/isms \
@@ -75,13 +83,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   runtime but not its headers: the parser includes NvInfer.h -> cuda_runtime_api.h (cudart-dev)
 #   -> crt/host_defines.h (crt). It links -lnvinfer alone, so both are compile-time only.
 #
-#   The 13-2 suffix tracks the CUDA the base image carries. A base image on a different CUDA fails
-#   here with "Unable to locate package", at build time and by name, which is the right place to
-#   find out.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#   The 13-2 suffix tracks the CUDA the x86 base image carries. The SBSA Spark image may ship
+#   13-0 or 13-1 instead — pick whichever cudart-dev/crt package exists rather than failing
+#   the build on a name that is right for one platform and missing on the other.
+RUN apt-get update && \
+    CUDA_PKGS="" && \
+    for cand in cuda-cudart-dev-13-2 cuda-cudart-dev-13-1 cuda-cudart-dev-13-0; do \
+        apt-cache show "$cand" >/dev/null 2>&1 && CUDA_PKGS="$CUDA_PKGS $cand" && break; \
+    done && \
+    for cand in cuda-crt-13-2 cuda-crt-13-1 cuda-crt-13-0; do \
+        apt-cache show "$cand" >/dev/null 2>&1 && CUDA_PKGS="$CUDA_PKGS $cand" && break; \
+    done && \
+    apt-get install -y --no-install-recommends \
         ffmpeg mediainfo bc curl git make cmake build-essential \
         python3-venv python3-yaml redis-tools libmosquitto1 \
-        cuda-cudart-dev-13-2 cuda-crt-13-2 libpython3.12 bsdextrautils \
+        libpython3.12 bsdextrautils $CUDA_PKGS \
     && rm -rf /var/lib/apt/lists/*
 
 # The base image ships a dpkg database that claims libvpx9, libx264, libx265, libmp3lame and
@@ -114,13 +130,17 @@ WORKDIR ${ISMS_ROOT}
 # and the VLM falls back to context frames.
 #
 # Only RTSP mode needs it. In file mode the crop is cut from the source .mp4 at the incident PTS
-# and no torch is involved.
+# and no torch is involved. On aarch64/SBSA there is no public pip CUDA wheel for GB10 — skip the
+# install and let the VLM fall back to context frames (same as WITH_RGB_CAPTURE=0).
 ARG WITH_RGB_CAPTURE=1
-RUN if [ "$WITH_RGB_CAPTURE" = "1" ]; then \
+ARG TARGETARCH
+RUN if [ "$WITH_RGB_CAPTURE" = "1" ] && [ "${TARGETARCH:-amd64}" != "arm64" ]; then \
         pip install --no-cache-dir --break-system-packages \
             torch --index-url https://download.pytorch.org/whl/cu126 \
         && pip install --no-cache-dir --break-system-packages opencv-python-headless \
         && python3 -c "import torch, cv2; from torch.utils.dlpack import from_dlpack" ; \
+    elif [ "$WITH_RGB_CAPTURE" = "1" ]; then \
+        echo "arm64/SBSA: skipping pip CUDA torch (no GB10 wheel); subject crops use context frames"; \
     fi
 
 # Services venv, kept out of system python for the reason above. Copied first so a source edit
@@ -134,8 +154,10 @@ RUN python3 -m venv build/venv-services \
 # its own container because services/api.py drives it by shelling out to scripts/serve_rtsp.sh —
 # a separate container would break the dashboard's live-view toggle.
 ARG MEDIAMTX_VER=v1.20.0
+ARG TARGETARCH
 RUN mkdir -p build/bin \
-    && curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VER}/mediamtx_${MEDIAMTX_VER}_linux_amd64.tar.gz" \
+    && case "${TARGETARCH:-amd64}" in arm64) MTX_ARCH=arm64 ;; *) MTX_ARCH=amd64 ;; esac \
+    && curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VER}/mediamtx_${MEDIAMTX_VER}_linux_${MTX_ARCH}.tar.gz" \
        | tar xz -C build/bin mediamtx \
     && build/bin/mediamtx --version
 
@@ -175,8 +197,8 @@ RUN mkdir -p data logs media build
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 8080 dashboard + API · 8554 RTSP · 8888 HLS · 8889 WebRTC · 9997 mediamtx control API
-EXPOSE 8080 8554 8888 8889 9997
+# 8080 dashboard + API (x86/Jetson) · 9080 on Spark when 8080 is taken · 8554 RTSP · 8888 HLS · 8889 WebRTC
+EXPOSE 8080 9080 8554 8888 8889 9997
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["serve"]

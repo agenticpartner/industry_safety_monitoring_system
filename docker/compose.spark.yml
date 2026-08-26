@@ -1,0 +1,51 @@
+# DGX Spark / ARM SBSA overlay. GB10 is not Jetson and not x86 — DeepStream, CUDA arch and
+# llama.cpp all have to be the SBSA/Blackwell variants or the image will not run.
+#
+#   docker compose -f docker/compose.yml -f docker/compose.spark.yml up --build -d
+#   ./scripts/docker_up.sh
+#
+# The Tegra multiarch DeepStream image is a different ARM ABI and fails on Spark with
+# missing libnvbufsurface. llama.cpp must be built with CUDA 13 for sm_121; CUDA 12.6
+# produces a binary whose every kernel launch fails.
+
+name: isms
+
+services:
+  app:
+    build:
+      args:
+        DS_IMAGE: nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark
+        WITH_RGB_CAPTURE: "0"
+    image: isms:sbsa
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video,graphics,display
+      # Label Studio already binds :8080 on this host. Host networking shares that port space.
+      ISMS_API_PORT: "9080"
+      # Spark image is built WITH_RGB_CAPTURE=0 (no CUDA torch). RTSP would otherwise default
+      # crops on and crash FrameCapture on `import torch`.
+      ISMS_RGB_CAPTURE: "0"
+
+  vlm:
+    build:
+      args:
+        CUDA_ARCHS: "121"
+        CUDA_DEVEL_IMAGE: nvidia/cuda:13.0.1-devel-ubuntu24.04
+        CUDA_RUNTIME_IMAGE: nvidia/cuda:13.0.1-runtime-ubuntu24.04
+    image: isms-llama:sbsa
+
+  llm:
+    build:
+      args:
+        CUDA_ARCHS: "121"
+        CUDA_DEVEL_IMAGE: nvidia/cuda:13.0.1-devel-ubuntu24.04
+        CUDA_RUNTIME_IMAGE: nvidia/cuda:13.0.1-runtime-ubuntu24.04
+    image: isms-llama:sbsa
+
+  media:
+    image: isms:sbsa
+
+  sources:
+    image: isms:sbsa
+
+  webcam:
+    image: isms:sbsa

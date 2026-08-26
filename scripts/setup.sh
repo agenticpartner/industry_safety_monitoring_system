@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # One-shot installer for a BARE-METAL install. Idempotent — safe to re-run at any point.
 #
-# Jetson is the reference target. It also runs on x86_64 with a discrete NVIDIA card, where the
-# Tegra-only steps (power mode, locked clocks) are skipped and the mediamtx download follows the
-# host architecture. The x86 path that gets exercised is docker/Dockerfile, which does the same
-# work in layers; this script is what a host install uses.
+# Jetson is the reference target. It also runs on x86_64 with a discrete NVIDIA card and on
+# DGX Spark (ARM SBSA), where the Tegra-only steps (power mode, locked clocks) are skipped and
+# the mediamtx download follows the host architecture. The x86/Spark path that gets exercised
+# is docker/Dockerfile; this script is what a host install uses.
 #
 #   ./scripts/setup.sh                  check hardware, then install everything
 #   ./scripts/setup.sh --check-only     run the hardware probe and stop
@@ -193,9 +193,10 @@ else
   echo "    .env already present, left untouched"
 fi
 
-if [ "${DETECTED_PLATFORM:-}" = dgpu ] || ! command -v nvpmodel >/dev/null 2>&1; then
-  # nvpmodel and jetson_clocks are Tegra tools. A discrete card has no equivalent worth setting
-  # here: it clocks itself, and `nvidia-smi -lgc` would pin frequencies the driver manages better.
+if [ "${DETECTED_PLATFORM:-}" = dgpu ] || [ "${DETECTED_PLATFORM:-}" = sbsa ] \
+    || ! command -v nvpmodel >/dev/null 2>&1; then
+  # nvpmodel and jetson_clocks are Tegra tools. A discrete card and DGX Spark have no equivalent
+  # worth setting here: the GPU clocks itself.
   echo "    not a Jetson: no power mode to set"
 elif [ "$NO_PERF" = 1 ]; then
   echo "    --no-perf-mode: leaving nvpmodel / clocks alone"

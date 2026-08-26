@@ -13,7 +13,11 @@
 # =================================================================================================
 # Stage 1 — compile llama.cpp against CUDA
 # =================================================================================================
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS build
+# Base images are build-args so DGX Spark (sm_121) can use CUDA 13 without forcing x86 deploys
+# off the CUDA 12.6 image they already run.
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+FROM ${CUDA_DEVEL_IMAGE} AS build
 
 # Which GPUs the binary can run on. The default spans the datacenter cards this is likely to meet
 # — 80 A100, 86 A10/A10G, 89 L4/L40S/RTX-40, 90 H100 — because an image built for one instance
@@ -56,7 +60,7 @@ RUN cmake -S /src -B /src/build \
 # =================================================================================================
 # Stage 2 — runtime
 # =================================================================================================
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+FROM ${CUDA_RUNTIME_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     WEIGHTS_DIR=/weights \

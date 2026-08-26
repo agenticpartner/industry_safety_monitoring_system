@@ -26,6 +26,7 @@ AUTOSTART="${ISMS_AUTOSTART:-1}"
 WIPE="${ISMS_WIPE:-1}"
 BATCH="${ISMS_ENGINE_BATCH:-20}"
 WAIT_VLM_S="${ISMS_WAIT_VLM_S:-0}"
+API_PORT="${ISMS_API_PORT:-8080}"
 
 step() { printf "\n\033[1m==> %s\033[0m\n" "$1"; }
 die()  { printf "\033[31mERROR: %s\033[0m\n" "$1" >&2; exit 1; }
@@ -147,6 +148,7 @@ case "${1:-serve}" in
 
   engines)
     bash scripts/check_hardware.sh --quiet || true
+    bash scripts/ensure_blackwell_nvinfer.sh || true
     refresh_from_image
     ensure_engines
     exit 0
@@ -166,13 +168,22 @@ case "${1:-serve}" in
     step "refreshing image-owned model files"
     refresh_from_image
 
+    bash scripts/ensure_blackwell_nvinfer.sh || true
+
     ensure_engines
 
     step "waiting for redis"
     wait_for_redis
 
-    [ -f media/cam01.mp4 ] || [ "$SOURCE" = rtsp ] \
-      || die "no media at media/cam01.mp4 — mount footage, or set ISMS_SOURCE=rtsp"
+    # Do not die here. The dashboard is the thing that answers on ISMS_API_PORT; killing the
+    # container because footage is missing is why :9080 looks empty on a fresh clone. Skip
+    # autostart instead — generate clips with:
+    #   ./scripts/docker_up.sh --profile media run --rm media
+    if [ "$SOURCE" = file ] && [ ! -f media/cam01.mp4 ]; then
+      echo "!! no media at media/cam01.mp4 — bringing the API up anyway; pipeline autostart skipped"
+      echo "!! generate demo clips: ./scripts/docker_up.sh --profile media run --rm media"
+      AUTOSTART=0
+    fi
 
     step "services"
     if [ "$WIPE" = 1 ]; then
@@ -192,10 +203,10 @@ case "${1:-serve}" in
     if [ "$AUTOSTART" = 1 ]; then
       step "pipeline: ${STREAMS} streams, source=${SOURCE}"
       for _ in $(seq 1 30); do
-        curl -sf -m 5 http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+        curl -sf -m 5 "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1 && break
         sleep 1
       done
-      start_url="http://127.0.0.1:8080/pipeline/start?streams=${STREAMS}&source=${SOURCE}&rtsp_out=true"
+      start_url="http://127.0.0.1:${API_PORT}/pipeline/start?streams=${STREAMS}&source=${SOURCE}&rtsp_out=true"
       # Unset means "let the API decide from the source mode", which is not the same as false.
       [ -n "${ISMS_RGB_CAPTURE:-}" ] && start_url="${start_url}&rgb_capture=${ISMS_RGB_CAPTURE}"
       curl -s -m 180 -X POST "$start_url" | sed 's/^/    /'
@@ -205,7 +216,7 @@ case "${1:-serve}" in
     cat <<EOF
 
 ==============================================================
- Up.  Dashboard: http://<host>:8080/
+ Up.  Dashboard: http://<host>:${API_PORT}/
 ==============================================================
 EOF
 

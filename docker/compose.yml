@@ -1,6 +1,8 @@
-# x86_64 dGPU deployment.
+# x86_64 dGPU deployment. On DGX Spark add `-f docker/compose.spark.yml`, or run
+# `./scripts/docker_up.sh` which picks the overlay from the host.
 #
 #   docker compose -f docker/compose.yml up --build -d
+#   docker compose -f docker/compose.yml -f docker/compose.spark.yml up --build -d
 #   docker compose -f docker/compose.yml logs -f app
 #   docker compose -f docker/compose.yml down
 #
@@ -40,7 +42,9 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: isms:x86
+      args:
+        DS_IMAGE: "${DS_IMAGE:-nvcr.io/nvidia/deepstream:9.1-samples-multiarch}"
+    image: "isms:${ISMS_IMAGE_TAG:-x86}"
     network_mode: host
     restart: unless-stopped
     depends_on:
@@ -56,6 +60,7 @@ services:
         required: false
 
     environment:
+      NVIDIA_DRIVER_CAPABILITIES: "${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,video,graphics,display}"
       ISMS_STREAMS: "${ISMS_STREAMS:-20}"
       ISMS_SOURCE: "${ISMS_SOURCE:-file}"
       ISMS_AUTOSTART: "${ISMS_AUTOSTART:-1}"
@@ -70,6 +75,9 @@ services:
       ISMS_RGB_CAPTURE: "${ISMS_RGB_CAPTURE:-}"
       ISMS_RTSP_BASE: "${ISMS_RTSP_BASE:-}"
       ISMS_RTSP_URLS: "${ISMS_RTSP_URLS:-}"
+      # Dashboard/API. 8080 is the Jetson/x86 default; Spark overlay moves it because Label
+      # Studio already owns 8080 on this host. Host networking, so this is a real host port.
+      ISMS_API_PORT: "${ISMS_API_PORT:-8080}"
 
     volumes:
       # Footage. Read-only: the pipeline decodes it and clip_service cuts from it with
@@ -107,7 +115,9 @@ services:
       dockerfile: docker/Dockerfile.llama
       args:
         CUDA_ARCHS: "${CUDA_ARCHS:-80;86;89;90}"
-    image: isms-llama:x86
+        CUDA_DEVEL_IMAGE: "${CUDA_DEVEL_IMAGE:-nvidia/cuda:12.6.3-devel-ubuntu24.04}"
+        CUDA_RUNTIME_IMAGE: "${CUDA_RUNTIME_IMAGE:-nvidia/cuda:12.6.3-runtime-ubuntu24.04}"
+    image: "isms-llama:${ISMS_IMAGE_TAG:-x86}"
     network_mode: host
     restart: unless-stopped
     gpus: all
@@ -141,7 +151,9 @@ services:
       dockerfile: docker/Dockerfile.llama
       args:
         CUDA_ARCHS: "${CUDA_ARCHS:-80;86;89;90}"
-    image: isms-llama:x86
+        CUDA_DEVEL_IMAGE: "${CUDA_DEVEL_IMAGE:-nvidia/cuda:12.6.3-devel-ubuntu24.04}"
+        CUDA_RUNTIME_IMAGE: "${CUDA_RUNTIME_IMAGE:-nvidia/cuda:12.6.3-runtime-ubuntu24.04}"
+    image: "isms-llama:${ISMS_IMAGE_TAG:-x86}"
     network_mode: host
     restart: unless-stopped
     gpus: all
@@ -182,7 +194,7 @@ services:
   # The only service that mounts media/ read-write; everything else only ever reads it.
   media:
     profiles: ["media"]
-    image: isms:x86
+    image: "isms:${ISMS_IMAGE_TAG:-x86}"
     gpus: all
     volumes:
       - ../media:/opt/isms/media
@@ -213,7 +225,7 @@ services:
   # networking there is one port space.
   sources:
     profiles: ["sources"]
-    image: isms:x86
+    image: "isms:${ISMS_IMAGE_TAG:-x86}"
     network_mode: host
     restart: unless-stopped
     environment:
@@ -228,6 +240,27 @@ services:
       - bash
       - -c
       - "scripts/serve_rtsp_sources.sh start ${ISMS_STREAMS:-20} && tail -f build/mediamtx-sources.log"
+
+  # USB webcam as one extra RTSP path on the same MediaMTX (:8654/webcam). Same profile as
+  # `sources` so it only starts when you asked for the camera farm. The pipeline still only
+  # sees RTSP — swap slot 20 (or any slot) with ISMS_RTSP_URLS; do not raise ISMS_STREAMS
+  # above the engine batch (20).
+  webcam:
+    profiles: ["sources"]
+    image: "isms:${ISMS_IMAGE_TAG:-x86}"
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - sources
+    devices:
+      - /dev/video0:/dev/video0
+    volumes:
+      # Host copy so a flag tweak does not require rebuilding the DeepStream image.
+      - ../scripts/serve_webcam.sh:/opt/isms/scripts/serve_webcam.sh:ro
+    environment:
+      RTSP_PORT: "8654"
+      VIDEO_DEV: "/dev/video0"
+    command: ["bash", "scripts/serve_webcam.sh"]
 
 volumes:
   models:

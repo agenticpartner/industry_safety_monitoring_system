@@ -108,13 +108,14 @@ dashboard's `/system` page.
 
 ## Hardware requirements
 
-Two platforms. **Jetson** is the reference target and runs on the host. **x86_64 with a discrete
-NVIDIA GPU** runs in Docker — see [Deploying on x86](#deploying-on-x86).
+Two platforms run on the host or in Docker. **Jetson** is the reference target and runs on the
+host. **x86_64 with a discrete NVIDIA GPU** and **DGX Spark (GB10, ARM SBSA)** run in Docker —
+see [Deploying on x86](#deploying-on-x86) and [Deploying on DGX Spark](#deploying-on-dgx-spark).
 
 The platform-specific parts are detected, not assumed: power modes and locked clocks are Tegra
 tools and are skipped elsewhere, DLA exists only on Jetson, and the dashboard's system chart reads
-`tegrastats` on Jetson and `nvidia-smi` on a discrete card. `./scripts/check_hardware.sh` reports
-which platform it found.
+`tegrastats` on Jetson and `nvidia-smi` on a discrete card or Spark. `./scripts/check_hardware.sh`
+reports which platform it found. Do not treat "this is aarch64" as Jetson — Spark is aarch64 too.
 
 | | Minimum | Reference platform |
 |---|---|---|
@@ -142,8 +143,8 @@ check exists because getting it wrong produces a failure a long way from its cau
 
 ## Quick start — Jetson
 
-A host install. For x86 see [Deploying on x86](#deploying-on-x86), which is a container and needs
-none of this.
+A host install. For x86 see [Deploying on x86](#deploying-on-x86). For DGX Spark see
+[Deploying on DGX Spark](#deploying-on-dgx-spark) — that is a container, not this script.
 
 ```bash
 git clone <your-fork-url> industry_safety_monitoring_system
@@ -315,6 +316,42 @@ which fills in `cam01 … camNN` from `sources.rtsp_pattern`.
 Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
 committed — the same reason `HF_TOKEN` lives in `.env`.
 
+#### D. USB webcam in one slot
+
+The pipeline has no `v4l2` source — only `file://` and `rtsp://` — and it cannot mix the two in
+one run. Publish the webcam as RTSP, restream the demo files on the same MediaMTX, and **swap
+one of the twenty URLs**. Do not add a 21st stream: TensorRT engines are built for batch 20.
+
+On DGX Spark this was verified with `/dev/video0` (UVC, MJPEG 1280×720 @ 30fps → 1080p30 H.264)
+occupying **CAM 20**. Dashboard stays on **:9080**.
+
+```bash
+# 1. Persist RTSP mode + CAM 20 = webcam (docker/.env is gitignored)
+./scripts/serve_webcam.sh urls 20   # cam01..cam19 + rtsp://127.0.0.1:8654/webcam
+# Put that list in docker/.env as ISMS_RTSP_URLS, with ISMS_SOURCE=rtsp, ISMS_STREAMS=20,
+# and ISMS_RGB_CAPTURE=0 on Spark (no CUDA torch — RTSP would otherwise crash on subject crops).
+
+# 2. File restreamers on :8654, plus the webcam publisher
+./scripts/docker_up.sh --profile sources up -d
+
+# 3. Recreate the app so it picks up docker/.env (restart is not enough)
+./scripts/docker_up.sh up -d --force-recreate app
+```
+
+Wait until `docker logs -f isms-webcam-1` shows `-> rtsp://127.0.0.1:8654/webcam`, then:
+
+```bash
+ffprobe -rtsp_transport tcp rtsp://127.0.0.1:8654/webcam
+curl -s http://127.0.0.1:9080/health   # :8080 on x86 Docker
+```
+
+Refresh the dashboard; tile **CAM 20** is the live camera. The other 19 tiles are still the
+demo files, now pulled as RTSP (realtime-paced, not a decode-ceiling run).
+
+To go back to files only: set `ISMS_SOURCE=file` in `docker/.env`, then
+`./scripts/docker_up.sh --profile sources stop` and
+`./scripts/docker_up.sh up -d --force-recreate app`.
+
 #### Making a mode stick
 
 The commands above set the mode for one invocation. To make it the default for this deployment,
@@ -394,8 +431,9 @@ Settings, in `docker/.env` or per-command:
 | `ISMS_RTSP_URLS` | comma-separated per-camera URLs; position is the camera id |
 | `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
 | `ISMS_WIPE` | wipe previous incidents on start, default 1 |
+| `ISMS_API_PORT` | dashboard/API port, default 8080; Spark overlay uses **9080** (Label Studio keeps 8080) |
 | `ISMS_RGB_CAPTURE` | subject crops; unset follows the source mode — on for `rtsp`, off for `file` |
-| `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` |
+| `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` (Spark overlay: `121`) |
 
 Subject crops need CUDA torch in the image, ~3.5 GB; `--build-arg WITH_RGB_CAPTURE=0` leaves it
 out and the VLM falls back to context frames. Only RTSP needs it — in file mode the crop is cut
@@ -413,6 +451,75 @@ from the source `.mp4` at the incident PTS.
 | VLM verdict | | 3.2-6.2 s PPE, 8.0-9.5 s overcrowding |
 
 Engine throughput is 1869 inf/s for PPE and 801 inf/s for fire, against budgets of 300 and 100.
+
+---
+
+## Deploying on DGX Spark
+
+DGX Spark is ARM SBSA (GB10), not Jetson. There is no JetPack, no DLA, no `nv3dsink`, and the
+Tegra DeepStream image will not run — it fails looking for `libnvbufsurface`. Use the Docker path
+with the Spark overlay. `./scripts/docker_up.sh` detects the host and adds it for you.
+
+```bash
+git clone <your-fork-url> industry_safety_monitoring_system
+cd industry_safety_monitoring_system
+
+# Footage still lives on the host (gitignored). Copy cam01.mp4 … cam20.mp4 into media/,
+# or build a set:
+#   docker compose -f docker/compose.yml -f docker/compose.spark.yml --profile media run --rm media
+
+./scripts/docker_up.sh
+```
+
+That is:
+
+```bash
+docker compose -f docker/compose.yml -f docker/compose.spark.yml up --build -d
+```
+
+Then `http://<spark>:9080/` (not 8080 — Label Studio already owns that port on a typical Spark
+desktop). First boot pulls the SBSA DeepStream image, builds TensorRT engines
+for sm_121, and compiles llama.cpp with CUDA 13 / `CMAKE_CUDA_ARCHITECTURES=121`. CUDA 12.6
+cannot produce GB10 kernels — a binary built for 80;86;89;90 will load and then fail every
+launch.
+
+What the overlay changes, and why:
+
+| | x86 | DGX Spark |
+|---|---|---|
+| DeepStream image | `9.1-samples-multiarch` | `9.1-triton-sbsa-dgx-spark` |
+| Display sink | `nveglglessink` | `nveglglessink` (not `nv3dsink`) |
+| llama.cpp CUDA | 12.6, archs 80;86;89;90 | 13.0, arch **121** |
+| nvinfer | weakly typed | `strongly-typed: 1` (Blackwell) |
+| Subject-crop torch | pip cu126 | omitted — VLM uses context frames |
+
+The rest of the stack is the same as [Deploying on x86](#deploying-on-x86): host networking,
+named volumes for engines and weights, file/RTSP source modes, `docker/.env` for stream count
+and camera URLs. Unified memory on Spark makes `nvidia-smi memory.total` report `[N/A]`; the
+dashboard chart then uses system RAM, which is the pool the GPU actually draws from.
+
+Do **not** run `scripts/setup.sh` on Spark expecting a Jetson-style host install. DeepStream
+arrives in the SBSA container.
+
+### Live webcam as CAM 20 (verified on this Spark)
+
+The stack does not ingest `/dev/video0` directly. These are the steps that worked here:
+
+1. Confirmed `/dev/video0` is a UVC capture node (MJPEG up to 4K; `/dev/video1` is not capture).
+2. Encoded a 3 s test inside `isms:sbsa`: MJPEG 1280×720 @ 30fps, scaled to 1920×1080, `libx264
+   -tune zerolatency` — ~30 fps, no dropped device.
+3. Wrote `docker/.env` with `ISMS_SOURCE=rtsp`, `ISMS_STREAMS=20`, and `ISMS_RTSP_URLS` from
+   `./scripts/serve_webcam.sh urls 20` (slots 1–19 = `…/camNN`, slot 20 = `…/webcam`).
+4. `./scripts/docker_up.sh --profile sources up -d` — MediaMTX on **:8654** restreams `media/`,
+   and the `webcam` service publishes `rtsp://127.0.0.1:8654/webcam` (host network +
+   `/dev/video0`; host `ffmpeg` is not required).
+5. `./scripts/docker_up.sh up -d --force-recreate app` so the app actually reads `docker/.env`.
+   `restart` keeps the old file-mode environment.
+6. Spark has no CUDA torch in the image, so `ISMS_RGB_CAPTURE=0` (also set by the Spark overlay).
+   Without it, RTSP autostart enables subject crops and the pipeline dies on `import torch`.
+
+Then `http://<spark>:9080/` — **CAM 20** is the webcam. Do not publish the camera to **:8554**;
+that port is the tiled *output*. Leave engines at batch 20. Same commands as [mode D](#d-usb-webcam-in-one-slot).
 
 ---
 
@@ -511,6 +618,7 @@ take minutes to reload. To free their ~12 GB as well: `pkill -x llama-server`.
 |---|---|
 | Dashboard | `http://<jetson>:8080/` |
 | System reference | `http://<jetson>:8080/system` |
+| Live flow | `http://<jetson>:8080/flow` |
 | API browser | `http://<jetson>:8080/docs` |
 | Tiled wall (RTSP) | `rtsp://<jetson>:8554/safety` |
 | Live view (WebRTC) | `http://<jetson>:8889/safety` |

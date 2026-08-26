@@ -6,10 +6,11 @@
 #
 # Exit code is 0 when nothing FAILed, 1 otherwise, so it can gate a deploy.
 #
-# Two platforms, one script. `jetson` is the reference target; `dgpu` is x86_64 with a discrete
-# NVIDIA card, which is how the Docker image runs. The checks that differ are the ones tied to
-# Tegra silicon — DLA, tegrastats, NVDEC device nodes, the board string — and each is gated on
-# PLATFORM rather than skipped by accident.
+# Three platforms, one script. `jetson` is the reference target (Tegra). `dgpu` is x86_64 with a
+# discrete NVIDIA card. `sbsa` is ARM server-class (DGX Spark / GB10 / Grace) — aarch64 with
+# nvidia-smi and NO Tegra BSP. The checks that differ are the ones tied to Tegra silicon — DLA,
+# tegrastats, NVDEC device nodes, the board string — and each is gated on PLATFORM rather than
+# skipped by accident. Never treat "has a device tree" as Jetson: Spark and Grace have one too.
 #
 # Every check below exists because getting it wrong produces a failure a long way from its cause.
 # The tracker's "Failed to initilaize low level lib", nvinfer's "setDimensions: Error Code 3" and
@@ -45,16 +46,26 @@ head_ "Platform"
 # ---------------------------------------------------------------------------------------------
 ARCH="$(uname -m)"
 
-# Tegra is identified by the device tree, never by the architecture alone: aarch64 is also every
-# ARM server and every Apple VM. /proc/device-tree/model is the authoritative board string there,
-# and it is NUL-terminated, hence the tr.
+# Tegra is identified by the L4T stamp, never by the architecture or by a device-tree file
+# existing. aarch64 is also every ARM server (DGX Spark, Grace, GB10) and every Apple VM, and
+# those boards expose /proc/device-tree/model too. /etc/nv_tegra_release is the Jetson marker.
 if [ -r /proc/device-tree/model ]; then
   DETECTED_BOARD="$(tr -d '\0' < /proc/device-tree/model)"
 fi
-if [ -n "$DETECTED_BOARD" ] || [ -r /etc/nv_tegra_release ]; then
+
+_GPU_NAME=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  _GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+fi
+
+if [ -r /etc/nv_tegra_release ]; then
   DETECTED_PLATFORM=jetson
-elif [ "$ARCH" = "x86_64" ] && command -v nvidia-smi >/dev/null 2>&1; then
+elif [ "$ARCH" = "x86_64" ] && [ -n "$_GPU_NAME" ]; then
   DETECTED_PLATFORM=dgpu
+elif [ "$ARCH" = "aarch64" ] && [ -n "$_GPU_NAME" ]; then
+  # ARM + a visible NVIDIA GPU + no L4T stamp: DGX Spark / GB10 / Grace SBSA.
+  DETECTED_PLATFORM=sbsa
+  [ -n "$DETECTED_BOARD" ] || DETECTED_BOARD="$_GPU_NAME"
 else
   DETECTED_PLATFORM=unknown
 fi
@@ -62,7 +73,8 @@ fi
 case "$DETECTED_PLATFORM" in
   jetson) ok "platform" "$ARCH — NVIDIA Jetson (reference target)" ;;
   dgpu)   ok "platform" "$ARCH — discrete NVIDIA GPU" ;;
-  *)      bad "platform" "$ARCH with no Tegra device tree and no nvidia-smi — no NVIDIA GPU found" ;;
+  sbsa)   ok "platform" "$ARCH — NVIDIA ARM SBSA (DGX Spark / GB10)" ;;
+  *)      bad "platform" "$ARCH with no Tegra L4T stamp and no nvidia-smi — no NVIDIA GPU found" ;;
 esac
 
 if [ "$DETECTED_PLATFORM" = jetson ]; then
@@ -87,24 +99,35 @@ if [ "$DETECTED_PLATFORM" = jetson ]; then
     warn "L4T / JetPack" "could not determine version"
   fi
 
-elif [ "$DETECTED_PLATFORM" = dgpu ]; then
-  DETECTED_BOARD="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-  DETECTED_VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
-  DETECTED_VRAM_MB="${DETECTED_VRAM_MB:-0}"
+elif [ "$DETECTED_PLATFORM" = dgpu ] || [ "$DETECTED_PLATFORM" = sbsa ]; then
+  DETECTED_BOARD="${_GPU_NAME:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)}"
+  DETECTED_VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')"
   [ -n "$DETECTED_BOARD" ] && ok "gpu" "$DETECTED_BOARD" || bad "gpu" "nvidia-smi returned no device"
 
-  # VRAM is the constraint that does not exist on Jetson, where the 64 GB is unified and the model
-  # servers draw from the same pool as the pipeline. Here they compete for a fixed, much smaller
-  # budget: ~13 GB for both llama.cpp servers, ~7 GB for the engines and twenty decode contexts.
-  if   [ "${DETECTED_VRAM_MB:-0}" -ge 40000 ]; then ok   "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB"
-  elif [ "${DETECTED_VRAM_MB:-0}" -ge 20000 ]; then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — fits the full stack with little headroom; quantise the VLM if llama.cpp fails to allocate"
-  elif [ "${DETECTED_VRAM_MB:-0}" -gt 0 ];     then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — run the vision path only, or reduce the stream count"
-  else                                              warn "VRAM" "could not read memory.total"
+  # DGX Spark unified memory reports "[N/A]" / "Not Supported" for nvidia-smi memory.total.
+  # That is not missing VRAM — the GPU draws from the same pool as the CPU. Treat it as unified
+  # and judge capacity from system RAM instead of a discrete-card VRAM number that does not exist.
+  if ! [ "${DETECTED_VRAM_MB:-}" -gt 0 ] 2>/dev/null; then
+    DETECTED_VRAM_MB=0
+    if [ "$DETECTED_PLATFORM" = sbsa ]; then
+      ok "memory" "unified with system RAM (nvidia-smi memory.total not reported on this GPU)"
+    else
+      warn "VRAM" "could not read memory.total"
+    fi
+  else
+    # VRAM is the constraint that does not exist on Jetson, where the 64 GB is unified and the
+    # model servers draw from the same pool as the pipeline. On a discrete card they compete for
+    # a fixed, much smaller budget: ~13 GB for both llama.cpp servers, ~7 GB for the engines.
+    if   [ "${DETECTED_VRAM_MB:-0}" -ge 40000 ]; then ok   "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB"
+    elif [ "${DETECTED_VRAM_MB:-0}" -ge 20000 ]; then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — fits the full stack with little headroom; quantise the VLM if llama.cpp fails to allocate"
+    elif [ "${DETECTED_VRAM_MB:-0}" -gt 0 ];     then warn "VRAM" "$((DETECTED_VRAM_MB / 1024)) GB — run the vision path only, or reduce the stream count"
+    fi
   fi
 
-  # DeepStream 9.1 documents driver 590+ for dGPU. A lower kernel driver still works when the
-  # container supplies its own newer user-mode driver (CUDA forward compatibility, datacenter GPUs
-  # only) — measured working on 580.126.20 with an L4. Outside a container it is a real floor.
+  # DeepStream 9.1 documents driver 590+ for dGPU / SBSA. A lower kernel driver still works when
+  # the container supplies its own newer user-mode driver (CUDA forward compatibility). DGX Spark
+  # typically ships a 580-branch driver with unified memory; the SBSA DeepStream image is the
+  # supported runtime, not a host SDK install.
   DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
   DRV_MAJOR="${DRV%%.*}"
   if [ -n "$DRV_MAJOR" ] && [ "$DRV_MAJOR" -ge 590 ] 2>/dev/null; then
@@ -145,7 +168,11 @@ if [ -d "$DS_ROOT" ]; then
   [ -n "$DS_VER" ] || DS_VER="$(basename "$(readlink -f "$DS_ROOT")")"
   ok "DeepStream" "${DS_VER:-present} at ${DS_ROOT}"
 else
-  bad "DeepStream" "not found at ${DS_ROOT} — install the DeepStream SDK, or set DS_ROOT"
+  if [ "${DETECTED_PLATFORM:-}" = sbsa ]; then
+    bad "DeepStream" "not on the host — expected on DGX Spark. Deploy with ./scripts/docker_up.sh (SBSA container), not scripts/setup.sh"
+  else
+    bad "DeepStream" "not found at ${DS_ROOT} — install the DeepStream SDK, or set DS_ROOT"
+  fi
 fi
 
 if command -v trtexec >/dev/null 2>&1; then
@@ -177,8 +204,15 @@ if command -v gst-inspect-1.0 >/dev/null 2>&1; then
     fi
   done
   # This one is only needed for the local display sink, so its absence is not fatal.
-  gst-inspect-1.0 nv3dsink >/dev/null 2>&1 && ok "plugin nv3dsink" "" \
-    || warn "plugin nv3dsink" "missing — local display output unavailable, dashboard/RTSP still work"
+  # Jetson renders with nv3dsink; dGPU and DGX Spark (ARM SBSA) use nveglglessink. Missing the
+  # one this platform needs only loses the local preview — dashboard/RTSP still work.
+  if [ "$DETECTED_PLATFORM" = jetson ]; then
+    gst-inspect-1.0 nv3dsink >/dev/null 2>&1 && ok "plugin nv3dsink" "" \
+      || warn "plugin nv3dsink" "missing — local display output unavailable, dashboard/RTSP still work"
+  else
+    gst-inspect-1.0 nveglglessink >/dev/null 2>&1 && ok "plugin nveglglessink" "" \
+      || warn "plugin nveglglessink" "missing — local display output unavailable, dashboard/RTSP still work"
+  fi
 else
   bad "gstreamer" "gst-inspect-1.0 not found"
 fi
@@ -205,10 +239,11 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   DETECTED_CUDA_ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')"
 fi
 if [ -z "$DETECTED_CUDA_ARCH" ]; then
-  case "$DETECTED_BOARD" in
+  case "${DETECTED_BOARD} ${_GPU_NAME}" in
     *Orin*) DETECTED_CUDA_ARCH=87 ;;
     *Thor*|*T264*) DETECTED_CUDA_ARCH=110 ;;
     *Xavier*) DETECTED_CUDA_ARCH=72 ;;
+    *GB10*|*Spark*|*GB300*) DETECTED_CUDA_ARCH=121 ;;
   esac
 fi
 [ -n "$DETECTED_CUDA_ARCH" ] && ok "CUDA arch" "sm_${DETECTED_CUDA_ARCH}" \

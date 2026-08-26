@@ -21,8 +21,8 @@ the single most common way a DeepStream YOLO integration silently produces zero 
 
 import json
 import shutil
-import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -30,32 +30,95 @@ ROOT = Path(__file__).resolve().parent.parent
 IMGSZ = 640
 OPSET = 17
 MAX_BATCH = 20
+DOWNLOAD_ATTEMPTS = 4
 
 MODELS = {
     "ppe": {
         "repo": "melihuzunoglu/ppe-detection",
         "file": "best.pt",
         "note": "YOLOv11 PPE — AGPL-3.0 (see the licensing section in README.md)",
+        "min_bytes": 3_000_000,
     },
     "fire": {
         "repo": "SalahALHaismawi/yolov26-fire-detection",
         "file": "best.pt",
         "note": "YOLOv26-S fire/smoke — MIT",
+        # Hub file is 20.3 MB. A truncated pull (seen as 9.6 MB) loads as a zip with no
+        # central directory and Ultralytics reports a "corrupted checkpoint".
+        "min_bytes": 15_000_000,
     },
 }
 
 
-def download(repo: str, fname: str, dst: Path) -> Path:
-    if dst.exists() and dst.stat().st_size > 0:
+def _looks_like_ckpt(path: Path, min_bytes: int) -> bool:
+    """Torch checkpoints are zip files (`PK`). HTML, LFS pointers and truncated Xet pulls are not."""
+    if not path.exists() or path.stat().st_size < min_bytes:
+        return False
+    with path.open("rb") as fh:
+        return fh.read(2) == b"PK"
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _download_hf_hub(repo: str, fname: str, dst: Path, *, force: bool = False) -> None:
+    from huggingface_hub import hf_hub_download
+
+    cached = hf_hub_download(
+        repo_id=repo, filename=fname, local_dir=str(dst.parent), force_download=force,
+    )
+    src = Path(cached)
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+
+
+def _download_urllib(repo: str, fname: str, dst: Path, min_bytes: int) -> None:
+    url = f"https://huggingface.co/{repo}/resolve/main/{fname}?download=true"
+    req = urllib.request.Request(url, headers={"User-Agent": "isms-export/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dst, "wb") as out:
+        expected = resp.headers.get("Content-Length")
+        shutil.copyfileobj(resp, out)
+        wrote = out.tell()
+    if expected and int(expected) != wrote:
+        raise OSError(f"truncated download: got {wrote} bytes, Content-Length {expected}")
+    if wrote < min_bytes:
+        raise OSError(f"truncated download: got {wrote} bytes, need at least {min_bytes}")
+
+
+def download(repo: str, fname: str, dst: Path, min_bytes: int) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if _looks_like_ckpt(dst, min_bytes):
         print(f"    {dst.name} already present ({dst.stat().st_size/1e6:.1f} MB)")
         return dst
-    url = f"https://huggingface.co/{repo}/resolve/main/{fname}"
-    print(f"    downloading {url}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as r, open(dst, "wb") as f:
-        shutil.copyfileobj(r, f)
-    print(f"    -> {dst} ({dst.stat().st_size/1e6:.1f} MB)")
-    return dst
+    _unlink(dst)
+
+    last_err: Exception | None = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        print(f"    downloading {repo}/{fname} (attempt {attempt}/{DOWNLOAD_ATTEMPTS})")
+        try:
+            try:
+                _download_hf_hub(repo, fname, dst, force=attempt > 1)
+            except ImportError:
+                _download_urllib(repo, fname, dst, min_bytes)
+            if not _looks_like_ckpt(dst, min_bytes):
+                size = dst.stat().st_size if dst.exists() else 0
+                raise OSError(f"{dst.name} is not a torch checkpoint ({size} bytes)")
+            print(f"    -> {dst} ({dst.stat().st_size/1e6:.1f} MB)")
+            return dst
+        except Exception as exc:  # noqa: BLE001 — retry the whole pull, then fail clearly
+            last_err = exc
+            print(f"    !! {exc}")
+            _unlink(dst)
+            sibling = dst.parent / fname
+            if sibling != dst:
+                _unlink(sibling)
+            if attempt < DOWNLOAD_ATTEMPTS:
+                time.sleep(2 * attempt)
+    raise SystemExit(f"could not download {repo}/{fname}: {last_err}")
 
 
 def export(name: str, spec: dict) -> dict:
@@ -80,7 +143,7 @@ def export(name: str, spec: dict) -> dict:
     print(f"\n=== {name} — {spec['repo']} ===")
     print(f"    {spec['note']}")
     outdir = ROOT / "models" / name / "model"
-    pt = download(spec["repo"], spec["file"], outdir / f"{name}.pt")
+    pt = download(spec["repo"], spec["file"], outdir / f"{name}.pt", spec["min_bytes"])
 
     model = YOLO(str(pt))
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))

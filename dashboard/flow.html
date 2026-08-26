@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live flow — Industry Safety Operations Monitoring</title>
+<!--
+  Live view of work moving through the architecture. /system stays a static measured reference;
+  this page is the monitor. Particles are driven from /metrics/flow and /events/stream:
+
+    gold trickle  — pipeline process is up. Batched inference, NOT one dot per frame.
+    coloured      — a new incident row landed (probe → Redis → event/clip).
+    teal          — a clip became ready.
+    purple        — Cosmos wrote a verdict. Serial: one request in flight.
+
+  prefers-reduced-motion disables particles and keeps the counters.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0f1b33; --surface-1:#1b2c4e; --surface-2:#23375d; --surface-3:#2c4270;
+    --border:#2b4272; --border-2:#3b568f;
+    --text-1:#eef2fa; --text-2:#a9b6d0; --text-3:#7385a6;
+    --accent:#f2b705; --accent-2:#ffd466;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#9085e9;
+    --ok:#2ecc8f; --warning:#e0a02a; --critical:#ff5d55;
+  }
+  @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation:none!important; transition:none!important; } }
+  * { box-sizing:border-box; }
+  html,body { margin:0; }
+  body {
+    background:var(--bg); color:var(--text-1);
+    font:14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  header {
+    position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:13px 20px; background:rgba(15,27,51,.92); backdrop-filter:blur(9px);
+    border-bottom:1px solid var(--border);
+  }
+  h1 { font-size:17px; margin:0; letter-spacing:-.01em; font-weight:650; }
+  h1 em { font-style:normal; color:var(--accent); }
+  .tag {
+    display:inline-block; font-size:10.5px; padding:2px 8px; border-radius:999px;
+    border:1px solid var(--border-2); color:var(--text-2); background:var(--surface-2);
+  }
+  .tag.ok { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 45%, transparent); }
+  .tag.warn { color:var(--warning); border-color:color-mix(in srgb, var(--warning) 45%, transparent); }
+  .tag.down { color:var(--critical); border-color:color-mix(in srgb, var(--critical) 45%, transparent); }
+  .hdr-links { margin-left:auto; display:flex; gap:8px; }
+  .back {
+    font-size:12px; color:var(--text-2); text-decoration:none;
+    border:1px solid var(--border-2); border-radius:9px; padding:6px 12px; background:var(--surface-2);
+  }
+  .back:hover { border-color:var(--accent); color:var(--text-1); }
+  main { max-width:1180px; margin:0 auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+  .card {
+    background:var(--surface-1); border:1px solid var(--border); border-radius:13px; padding:16px 18px;
+  }
+  h2 {
+    font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--text-3);
+    margin:0 0 12px; font-weight:600; display:flex; align-items:center; gap:8px;
+  }
+  h2::before { content:""; width:3px; height:13px; border-radius:2px; background:var(--accent); flex:none; }
+  p { margin:0 0 10px; color:var(--text-2); }
+  .lede { color:var(--text-2); font-size:13px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:11px; }
+  .stat { background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:11px 13px; }
+  .stat .big { font-size:22px; font-weight:680; letter-spacing:-.02em; color:var(--accent);
+               line-height:1.15; font-variant-numeric:tabular-nums; }
+  .stat .l { font-size:11.5px; color:var(--text-3); margin-top:3px; }
+  .note {
+    border-left:3px solid var(--accent); background:var(--surface-2); border-radius:0 8px 8px 0;
+    padding:9px 13px; font-size:12.5px; color:var(--text-2); margin:12px 0 0;
+  }
+  .note b { color:var(--accent-2); }
+  .wrap { overflow-x:auto; }
+  svg { display:block; max-width:100%; }
+  .legend { display:flex; flex-wrap:wrap; gap:10px 16px; font-size:12px; color:var(--text-2); margin-top:12px; }
+  .legend i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .cols { display:grid; grid-template-columns:1fr minmax(260px, 320px); gap:16px; }
+  @media (max-width:900px){ .cols { grid-template-columns:1fr; } }
+  #log {
+    list-style:none; margin:0; padding:0; max-height:360px; overflow:auto;
+    font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color:var(--text-2);
+  }
+  #log li { padding:5px 0; border-bottom:1px solid var(--border); }
+  #log li:first-child { color:var(--text-1); }
+  #log .k { color:var(--accent-2); }
+  footer { color:var(--text-3); font-size:12px; padding:6px 20px 30px; text-align:center; }
+  a { color:var(--accent-2); }
+  .node.busy { filter: drop-shadow(0 0 7px rgba(242,183,5,.55)); }
+  .node.busy-vlm { filter: drop-shadow(0 0 7px rgba(144,133,233,.7)); }
+  .node.busy-alert { filter: drop-shadow(0 0 7px rgba(255,93,85,.55)); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>◎ Live <em>flow</em></h1>
+  <span class="tag" id="t-pipe">pipeline</span>
+  <span class="tag" id="t-redis">Redis</span>
+  <span class="tag" id="t-vlm">Cosmos</span>
+  <div class="hdr-links">
+    <a class="back" href="/system">🧠 system</a>
+    <a class="back" href="/">← dashboard</a>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>What is moving</h2>
+    <p class="lede">
+      Particles track real work. The gold trickle means the DeepStream graph is up (batched
+      inference — not one particle per frame). Coloured particles are incidents, clips and
+      Cosmos verdicts. Cosmos is a <b>cold path</b>: one request in flight, not 20 streams.
+    </p>
+    <div class="stats">
+      <div class="stat"><div class="big" id="s-streams">—</div><div class="l">streams in the graph</div></div>
+      <div class="stat"><div class="big" id="s-fps">—</div><div class="l">target fps (streams × rate)</div></div>
+      <div class="stat"><div class="big" id="s-inc">—</div><div class="l">incidents in the last 90 s</div></div>
+      <div class="stat"><div class="big" id="s-clip">—</div><div class="l">clips waiting / recording</div></div>
+      <div class="stat"><div class="big" id="s-vlm">—</div><div class="l">waiting for Cosmos</div></div>
+      <div class="stat"><div class="big" id="s-gpu">—</div><div class="l">GPU · NVDEC %</div></div>
+    </div>
+  </section>
+
+  <div class="cols">
+    <section class="card">
+      <h2>Architecture</h2>
+      <div class="wrap">
+        <svg viewBox="0 0 1120 360" width="1120" height="360" role="img"
+             aria-label="live pipeline with work moving along the edges">
+          <defs>
+            <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M0 0 L10 5 L0 10 z" fill="#7385a6"/>
+            </marker>
+            <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+              <feGaussianBlur stdDeviation="2.4" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            <style>
+              .b { fill:#23375d; stroke:#3b568f; rx:8; }
+              .bx { fill:#2c4270; stroke:#f2b705; }
+              .bv { fill:#2c4270; stroke:#9085e9; }
+              .t { fill:#eef2fa; font:12px ui-sans-serif, system-ui; }
+              .ts { fill:#7385a6; font:10px ui-sans-serif, system-ui; }
+              .ln { stroke:#7385a6; stroke-width:1.5; fill:none; marker-end:url(#a); }
+              .lnd { stroke:#f2b705; stroke-width:1.5; fill:none; stroke-dasharray:4 3; marker-end:url(#a); }
+              .lnv { stroke:#9085e9; stroke-width:1.5; fill:none; stroke-dasharray:4 3; marker-end:url(#a); }
+            </style>
+          </defs>
+
+          <g class="node" id="n-src"><rect class="b" x="8" y="60" width="104" height="52"/>
+            <text class="t" x="26" y="82">sources</text>
+            <text class="ts" x="26" y="98" id="lbl-src">file / RTSP</text></g>
+          <g class="node" id="n-mux"><rect class="b" x="140" y="60" width="104" height="52"/>
+            <text class="t" x="158" y="82">nvstreammux</text>
+            <text class="ts" x="158" y="98">batch</text></g>
+          <g class="node" id="n-ppe"><rect class="bx" x="272" y="30" width="112" height="52"/>
+            <text class="t" x="290" y="52">nvinfer PPE</text>
+            <text class="ts" x="290" y="68">FP16 · every frame</text></g>
+          <g class="node" id="n-fire"><rect class="bx" x="272" y="102" width="112" height="52"/>
+            <text class="t" x="290" y="124">nvinfer fire</text>
+            <text class="ts" x="290" y="140">FP16 · every 2nd</text></g>
+          <g class="node" id="n-trk"><rect class="b" x="412" y="60" width="104" height="52"/>
+            <text class="t" x="430" y="82">nvtracker</text>
+            <text class="ts" x="430" y="98">NvSORT</text></g>
+          <g class="node" id="n-an"><rect class="b" x="544" y="60" width="112" height="52"/>
+            <text class="t" x="562" y="82">nvdsanalytics</text>
+            <text class="ts" x="562" y="98">zones / ROI</text></g>
+          <g class="node" id="n-tiler"><rect class="b" x="684" y="60" width="104" height="52"/>
+            <text class="t" x="702" y="82">tiler + OSD</text>
+            <text class="ts" x="702" y="98">GPU, not VIC</text></g>
+          <g class="node" id="n-disp"><rect class="b" x="816" y="24" width="104" height="48"/>
+            <text class="t" x="834" y="45">nv3dsink</text>
+            <text class="ts" x="834" y="61">local display</text></g>
+          <g class="node" id="n-enc"><rect class="b" x="816" y="98" width="104" height="48"/>
+            <text class="t" x="834" y="119">NVENC</text>
+            <text class="ts" x="834" y="135">RTSP / WebRTC</text></g>
+
+          <g class="node" id="n-probe"><rect class="bx" x="544" y="190" width="112" height="54"/>
+            <text class="t" x="562" y="212">probe</text>
+            <text class="ts" x="562" y="228">rules → events</text></g>
+          <g class="node" id="n-redis"><rect class="b" x="700" y="190" width="104" height="54"/>
+            <text class="t" x="718" y="212">Redis</text>
+            <text class="ts" x="718" y="228" id="lbl-redis">stream</text></g>
+          <g class="node" id="n-svc"><rect class="b" x="848" y="190" width="140" height="54"/>
+            <text class="t" x="866" y="212">event + clip</text>
+            <text class="ts" x="866" y="228">SQLite · evidence</text></g>
+          <g class="node" id="n-vlm"><rect class="bv" x="848" y="270" width="140" height="54"/>
+            <text class="t" x="866" y="292">Cosmos Reason</text>
+            <text class="ts" x="866" y="308">serial · 1 in flight</text></g>
+
+          <path class="ln"  id="p-src-mux"    d="M112 86 H136"/>
+          <path class="ln"  id="p-mux-ppe"    d="M244 86 C258 86 258 56 268 56"/>
+          <path class="ln"  id="p-mux-fire"   d="M244 86 C258 86 258 128 268 128"/>
+          <path class="ln"  id="p-ppe-trk"    d="M384 56 C398 56 398 86 408 86"/>
+          <path class="ln"  id="p-fire-trk"   d="M384 128 C398 128 398 86 408 86"/>
+          <path class="ln"  id="p-trk-an"     d="M516 86 H540"/>
+          <path class="ln"  id="p-an-tiler"   d="M656 86 H680"/>
+          <path class="ln"  id="p-tiler-disp" d="M788 86 C800 86 800 48 812 48"/>
+          <path class="ln"  id="p-tiler-enc"  d="M788 86 C800 86 800 122 812 122"/>
+          <path class="lnd" id="p-an-probe"   d="M600 112 V186"/>
+          <path class="lnd" id="p-probe-redis" d="M656 217 H696"/>
+          <path class="lnd" id="p-redis-svc"  d="M804 217 H844"/>
+          <path class="lnv" id="p-svc-vlm"    d="M918 244 V266"/>
+          <text class="ts" x="606" y="152">metadata, inline</text>
+
+          <g id="particles"></g>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i style="background:#f2b705"></i>inference running</span>
+        <span><i style="background:#f2b705; outline:1px solid #f2b705"></i>PPE incident</span>
+        <span><i style="background:#ff5d55"></i>fire incident</span>
+        <span><i style="background:#d55181"></i>overcrowding</span>
+        <span><i style="background:#3987e5"></i>other incident</span>
+        <span><i style="background:#199e70"></i>clip ready</span>
+        <span><i style="background:#9085e9"></i>Cosmos verdict</span>
+      </div>
+      <div class="note">
+        <b>Not a frame counter.</b> Twenty 1080p30 streams would be hundreds of particles a
+        second and would lie about what the operator can act on. The gold path is a heartbeat.
+        Incidents, clips and verdicts are 1:1 with store rows.
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Work log</h2>
+      <ul id="log" aria-live="polite"></ul>
+    </section>
+  </div>
+</main>
+
+<footer>Industry Safety Operations Monitoring System · live work, not decoration</footer>
+
+<script>
+(function () {
+  const REDUCE = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const NS = "http://www.w3.org/2000/svg";
+  const layer = document.getElementById("particles");
+  const MAX_DOTS = 42;
+
+  const TYPE_COLOR = {
+    fire_alert: "#ff5d55",
+    ppe_violation: "#f2b705",
+    ppe: "#f2b705",
+    overcrowding: "#d55181",
+    zone_intrusion: "#3987e5",
+  };
+
+  const seen = new Set();
+  const verdicts = new Map();
+  const clips = new Map();
+  let primed = false;
+  let lastRedis = null;
+  let pipelineUp = false;
+
+  function $(id) { return document.getElementById(id); }
+
+  function spawnAlong(pathId, color, dur, r) {
+    if (REDUCE) return;
+    const path = $(pathId);
+    if (!path) return;
+    if (layer.childElementCount >= MAX_DOTS) return;
+    const len = path.getTotalLength();
+    if (!len) return;
+    const c = document.createElementNS(NS, "circle");
+    c.setAttribute("r", r || 3.4);
+    c.setAttribute("fill", color);
+    c.setAttribute("filter", "url(#glow)");
+    layer.appendChild(c);
+    const t0 = performance.now();
+    function frame(t) {
+      const u = Math.min(1, (t - t0) / dur);
+      const p = path.getPointAtLength(u * len);
+      c.setAttribute("cx", p.x);
+      c.setAttribute("cy", p.y);
+      const fade = u < 0.08 ? u / 0.08 : (1 - u < 0.12 ? (1 - u) / 0.12 : 1);
+      c.setAttribute("opacity", String(fade));
+      if (u < 1) requestAnimationFrame(frame);
+      else c.remove();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function spawnChain(ids, color, dur) {
+    ids.forEach((id, i) => {
+      setTimeout(() => spawnAlong(id, color, dur, 3.4), i * dur * 0.52);
+    });
+  }
+
+  function flash(id, cls, ms) {
+    const el = $(id);
+    if (!el) return;
+    el.classList.add(cls);
+    setTimeout(() => el.classList.remove(cls), ms || 900);
+  }
+
+  function log(html) {
+    const ul = $("log");
+    const li = document.createElement("li");
+    li.innerHTML = html;
+    ul.prepend(li);
+    while (ul.children.length > 80) ul.lastChild.remove();
+  }
+
+  function clock(ts) {
+    const d = ts ? new Date(ts * 1000) : new Date();
+    return d.toLocaleTimeString([], { hour12: false });
+  }
+
+  function typeColor(type) {
+    return TYPE_COLOR[type] || "#d55181";
+  }
+
+  function incidentFlow(ev) {
+    spawnChain(["p-an-probe", "p-probe-redis", "p-redis-svc"], typeColor(ev.type), 850);
+    flash("n-probe", "busy-alert", 700);
+    flash("n-redis", "busy", 700);
+    log(`${clock(ev.ts)}  <span class="k">cam${String(ev.camera_id).padStart(2,"0")}</span>  ${ev.type}  → Redis`);
+  }
+
+  function clipFlow(ev) {
+    spawnAlong("p-redis-svc", "#199e70", 900, 3.8);
+    flash("n-svc", "busy", 800);
+    log(`${clock(ev.ts)}  <span class="k">cam${String(ev.camera_id).padStart(2,"0")}</span>  clip ${ev.clip_state}`);
+  }
+
+  function vlmFlow(ev) {
+    spawnAlong("p-svc-vlm", "#9085e9", 1100, 4.2);
+    flash("n-vlm", "busy-vlm", 1400);
+    log(`${clock()}  <span class="k">cam${String(ev.camera_id).padStart(2,"0")}</span>  Cosmos ${ev.vlm_verdict}`);
+  }
+
+  function trickle() {
+    if (!pipelineUp || REDUCE) return;
+    const fire = Math.random() < 0.35;
+    const chain = fire
+      ? ["p-src-mux", "p-mux-fire", "p-fire-trk", "p-trk-an", "p-an-tiler", "p-tiler-enc"]
+      : ["p-src-mux", "p-mux-ppe", "p-ppe-trk", "p-trk-an", "p-an-tiler", "p-tiler-disp"];
+    spawnChain(chain, "#f2b705", 720);
+  }
+
+  function setTag(id, ok, label) {
+    const el = $(id);
+    el.textContent = label;
+    el.className = "tag " + (ok ? "ok" : "down");
+  }
+
+  function applySnapshot(s) {
+    pipelineUp = !!s.pipeline;
+    $("s-streams").textContent = s.pipeline ? s.streams : "0";
+    $("s-fps").textContent = s.pipeline ? s.realtime_target_fps : "—";
+    $("s-inc").textContent = s.incidents_90s;
+    $("s-clip").textContent = `${s.clip_pending}`;
+    $("s-vlm").textContent = s.vlm_waiting;
+    const gpu = s.gpu == null ? "—" : Math.round(s.gpu);
+    const nv = s.nvdec == null ? "—" : Math.round(s.nvdec);
+    $("s-gpu").textContent = `${gpu} · ${nv}`;
+    $("lbl-src").textContent = s.source_mode || "file / RTSP";
+    $("lbl-redis").textContent = s.redis_len == null ? "down" : `${s.redis_len} queued`;
+
+    setTag("t-pipe", s.pipeline, s.pipeline ? `pipeline · ${s.streams}` : "pipeline down");
+    setTag("t-redis", s.redis_len != null && s.event_service, s.redis_len == null ? "Redis down" : "Redis");
+    setTag("t-vlm", s.reasoning_service, s.reasoning_service
+      ? (s.vlm_waiting ? `Cosmos · ${s.vlm_waiting} waiting` : "Cosmos idle")
+      : "Cosmos down");
+
+    ["n-ppe", "n-fire", "n-mux", "n-tiler"].forEach(id => {
+      $(id).classList.toggle("busy", !!s.pipeline);
+    });
+    $("n-vlm").classList.toggle("busy-vlm", s.vlm_waiting > 0 && s.reasoning_service);
+
+    if (!primed) {
+      (s.recent || []).forEach(ev => {
+        seen.add(ev.id);
+        verdicts.set(ev.id, ev.vlm_verdict);
+        clips.set(ev.id, ev.clip_state);
+      });
+      lastRedis = s.redis_len;
+      primed = true;
+      return;
+    }
+
+    let spawned = 0;
+    for (const ev of (s.recent || []).slice().reverse()) {
+      if (!seen.has(ev.id)) {
+        seen.add(ev.id);
+        verdicts.set(ev.id, ev.vlm_verdict);
+        clips.set(ev.id, ev.clip_state);
+        if (spawned < 8) { incidentFlow(ev); spawned++; }
+        continue;
+      }
+      const prevV = verdicts.get(ev.id);
+      if (prevV !== ev.vlm_verdict && ev.vlm_verdict && ev.vlm_verdict !== "unverified") {
+        verdicts.set(ev.id, ev.vlm_verdict);
+        vlmFlow(ev);
+      }
+      const prevC = clips.get(ev.id);
+      if (prevC !== ev.clip_state && ev.clip_state === "ready") {
+        clips.set(ev.id, ev.clip_state);
+        clipFlow(ev);
+      } else {
+        clips.set(ev.id, ev.clip_state);
+      }
+    }
+    if (seen.size > 400) {
+      const keep = new Set((s.recent || []).map(e => e.id));
+      for (const id of seen) if (!keep.has(id)) { seen.delete(id); verdicts.delete(id); clips.delete(id); }
+    }
+    if (s.redis_len != null && lastRedis != null && s.redis_len > lastRedis) {
+      flash("n-redis", "busy", 500);
+    }
+    lastRedis = s.redis_len;
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch("/metrics/flow", { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      applySnapshot(await r.json());
+    } catch (e) {
+      setTag("t-pipe", false, "API unreachable");
+    }
+  }
+
+  function connectWs() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}/events/stream`);
+    ws.onmessage = (msg) => {
+      let data;
+      try { data = JSON.parse(msg.data); } catch { return; }
+      for (const ev of data.events || []) {
+        if (seen.has(ev.id)) continue;
+        seen.add(ev.id);
+        verdicts.set(ev.id, ev.vlm_verdict);
+        clips.set(ev.id, ev.clip_state);
+        incidentFlow(ev);
+      }
+    };
+    ws.onclose = () => setTimeout(connectWs, 4000);
+  }
+
+  poll();
+  setInterval(poll, 1500);
+  setInterval(trickle, 850);
+  connectWs();
+})();
+</script>
+</body>
+</html>

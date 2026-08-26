@@ -102,6 +102,7 @@
   }
   button:hover { background:var(--surface-3); border-color:var(--text-3); }
   button:active { transform: translateY(1px); }
+  button:disabled { opacity:.55; cursor:wait; transform:none; }
   button.primary { background:var(--s1); border-color:var(--s1); color:#fff; }
   button.danger  { background:var(--critical); border-color:var(--critical); color:#fff; }
 
@@ -229,14 +230,14 @@
     background:rgba(0,0,0,.6); padding:3px 9px; border-radius:999px; font-size:11px; color:#fff;
   }
   /* An <a> among <button>s: styled to match so the header reads as one control group. */
-  #btn-brain {
+  #btn-brain, #btn-flow {
     display:inline-flex; align-items:center; gap:6px; text-decoration:none;
     font:inherit; font-size:13px; color:var(--text-1);
     background:var(--surface-2); border:1px solid var(--border-2); border-radius:9px;
     padding:7px 12px; cursor:pointer;
   }
-  #btn-brain:hover { border-color:var(--accent); }
-  @media (max-width:720px){ #btn-brain span { display:none; } }
+  #btn-brain:hover, #btn-flow:hover { border-color:var(--accent); }
+  @media (max-width:720px){ #btn-brain span, #btn-flow span { display:none; } }
 
   .live-badge .dot { background:var(--critical); animation: blink 1.6s ease-in-out infinite; }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
@@ -386,6 +387,10 @@
            max-width:min(880px,94vw); padding:0; }
   dialog::backdrop { background:rgba(0,0,0,.65); backdrop-filter:blur(2px); }
   .dlg-body { padding:16px 18px 18px; }
+  #pipe-dlg { max-width:min(460px,94vw); }
+  #pipe-dlg h2 { margin:0 0 8px; font-size:16px; letter-spacing:-.01em; }
+  #pipe-dlg p { margin:0 0 16px; color:var(--text-2); font-size:13.5px; line-height:1.55; }
+  #pipe-dlg .actions { display:flex; gap:8px; justify-content:flex-end; }
   video.clip { width:100%; border-radius:9px; background:#000; }
   table { border-collapse:collapse; width:100%; font-size:12px; }
   th,td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); }
@@ -407,9 +412,12 @@
   <span class="pill" id="p-fps">—</span>
   <span class="spacer"></span>
   <button id="btn-sound" title="Alarm sound needs one click before a browser will allow audio">🔇 sound off</button>
+  <button id="btn-pipe" title="Stop inference and free the GPU">⏸ Pause</button>
   <button id="btn-live">Live view</button>
   <!-- Opens in a new tab on purpose: it is a reference to read alongside the running dashboard,
        and navigating away would drop the WebRTC session and the alarm's primed state. -->
+  <a id="btn-flow" href="/flow" target="_blank" rel="noopener"
+     title="Live particles: inference, incidents, clips and Cosmos verdicts">◎ <span>Flow</span></a>
   <a id="btn-brain" href="/system" target="_blank" rel="noopener"
      title="Models, benchmarks, latencies and how the pipeline connects">🧠 <span>System</span></a>
   <button id="btn-theme">◐</button>
@@ -521,6 +529,17 @@
       <button id="dlg-reject">Mark false positive</button>
       <button class="primary" id="dlg-confirm">Confirm violation</button>
       <button id="dlg-close">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="pipe-dlg" aria-labelledby="pipe-dlg-title">
+  <div class="dlg-body">
+    <h2 id="pipe-dlg-title">Pause the pipeline?</h2>
+    <p id="pipe-dlg-body"></p>
+    <div class="actions">
+      <button id="pipe-dlg-cancel" type="button">Cancel</button>
+      <button id="pipe-dlg-ok" type="button" class="danger">Pause</button>
     </div>
   </div>
 </dialog>
@@ -924,6 +943,134 @@ $("#btn-live").onclick = () => {
   if (!card.hidden && !pc) startLive();
 };
 
+/* ---------- pause / resume the DeepStream graph ----------
+   This is a real stop, not a freeze-frame: TensorRT engines unload with the process, which is
+   what frees the GPU. Cosmos and the agent stay loaded because bringing them back takes minutes.
+   Resume restages the same cameras / live output that were running, not the 1-file demo.yml. */
+let PIPE = { running: false, last: null };
+
+function rememberPipe(st) {
+  PIPE.running = !!st.running;
+  const src = st.running ? {
+    streams: st.streams,
+    source_mode: st.source_mode,
+    rtsp_out: !!st.rtsp_out,
+    rgb_capture: st.rgb_capture,
+    drop_frame_interval: st.drop_frame_interval,
+  } : (st.last_run ? {
+    streams: st.last_run.streams,
+    source_mode: st.last_run.source,
+    rtsp_out: !!st.last_run.rtsp_out,
+    rgb_capture: st.last_run.rgb_capture,
+    drop_frame_interval: st.last_run.drop_frame_interval,
+  } : PIPE.last);
+  if (src) PIPE.last = src;
+}
+
+function paintPipeButton() {
+  const btn = $("#btn-pipe");
+  if (!btn || btn.dataset.busy === "1") return;
+  if (PIPE.running) {
+    btn.textContent = "⏸ Pause";
+    btn.classList.remove("primary");
+    btn.title = "Stop inference and free the GPU";
+  } else {
+    btn.textContent = "▶ Resume";
+    btn.classList.add("primary");
+    btn.title = "Restart the pipeline with the same cameras";
+  }
+}
+
+function confirmPipe(kind) {
+  return new Promise((resolve) => {
+    const dlg = $("#pipe-dlg");
+    const pause = kind === "pause";
+    $("#pipe-dlg-title").textContent = pause ? "Pause the pipeline?" : "Resume the pipeline?";
+    $("#pipe-dlg-body").textContent = pause
+      ? "This stops the DeepStream graph — every camera, detector and the live wall. The GPU those engines are using will free. Cosmos and the agent stay loaded (reloading them takes minutes). Incidents already in the queue still get clips and verdicts."
+      : "This restarts inference with the same cameras and live output. GPU load comes back as the engines load, usually a few seconds.";
+    const ok = $("#pipe-dlg-ok");
+    ok.textContent = pause ? "Pause" : "Resume";
+    ok.className = pause ? "danger" : "primary";
+    let settled = false;
+    const finish = (yes) => {
+      if (settled) return;
+      settled = true;
+      dlg.removeEventListener("close", onClose);
+      ok.onclick = null;
+      $("#pipe-dlg-cancel").onclick = null;
+      if (dlg.open) dlg.close();
+      resolve(yes);
+    };
+    const onClose = () => finish(false);
+    dlg.addEventListener("close", onClose);
+    ok.onclick = () => finish(true);
+    $("#pipe-dlg-cancel").onclick = () => finish(false);
+    dlg.showModal();
+  });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function waitForPipe(wantRunning, ms = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    try {
+      const st = await get("/pipeline/status");
+      rememberPipe(st);
+      if (!!st.running === wantRunning) return st;
+    } catch { /* keep waiting */ }
+    await sleep(400);
+  }
+  return null;
+}
+
+function dropLiveView() {
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  const v = $("#live-video");
+  v.srcObject = null;
+  v.removeAttribute("src");
+  $("#live-ph").style.display = "grid";
+  $("#live-reason").textContent = "Pipeline paused — GPU is free. Resume to bring the wall back.";
+  $("#live-action").textContent = "";
+  const startBtn = $("#btn-rtsp-start");
+  if (startBtn) startBtn.hidden = true;
+}
+
+$("#btn-pipe").onclick = async () => {
+  const pause = PIPE.running;
+  if (!await confirmPipe(pause ? "pause" : "resume")) return;
+  const btn = $("#btn-pipe");
+  btn.dataset.busy = "1";
+  btn.disabled = true;
+  btn.textContent = pause ? "pausing…" : "resuming…";
+  try {
+    if (pause) {
+      dropLiveView();
+      await fetch("/pipeline/stop", { method: "POST" });
+      await waitForPipe(false, 8000);
+    } else {
+      const L = PIPE.last || {};
+      const q = new URLSearchParams();
+      if (L.streams) q.set("streams", String(L.streams));
+      if (L.source_mode) q.set("source", L.source_mode);
+      q.set("rtsp_out", L.rtsp_out === false ? "false" : "true");
+      if (L.rgb_capture === true || L.rgb_capture === false)
+        q.set("rgb_capture", String(L.rgb_capture));
+      if (L.drop_frame_interval != null)
+        q.set("drop_frame_interval", String(L.drop_frame_interval));
+      const r = await fetch("/pipeline/start?" + q, { method: "POST" });
+      if (!r.ok) throw new Error("start " + r.status);
+      await waitForPipe(true, 20000);
+      if (!$("#live-card").hidden) setTimeout(startLive, 2500);
+    }
+  } catch (e) { /* refreshHealth reports the resulting state */ }
+  btn.dataset.busy = "0";
+  btn.disabled = false;
+  paintPipeButton();
+  refreshHealth();
+};
+
 /* Fullscreen the wall. Twenty tiles inside a dashboard card are ~180px wide each, which is not
    enough to see a bounding box, let alone read the OSD. Fullscreen is what makes the live view
    usable as a monitoring wall rather than a thumbnail. */
@@ -964,10 +1111,13 @@ async function refreshHealth(){
     $("#d-vlm").className  = "dot " + (h.vlm?"up":"down");
     $("#d-llm").className  = "dot " + (h.agent_llm?"up":"down");
     const st = await get("/pipeline/status");
+    rememberPipe(st);
+    paintPipeButton();
     const diff = st.config_differs ? ` (cfg ${st.configured.streams})` : "";
+    const lastN = (PIPE.last && PIPE.last.streams) || st.configured.streams;
     $("#p-fps").textContent = st.running
       ? `${st.streams} streams${diff} · ${st.analytics_fps_per_stream} fps · target ${st.realtime_target_fps}`
-      : `stopped · configured ${st.configured.streams}`;
+      : `paused · resume ${lastN} streams`;
   }catch(e){}
 }
 const PREV = {};
@@ -997,13 +1147,13 @@ async function refreshSystem(){
   // do not say which, so the platform is named rather than inferred from a missing series.
   const plat = $("#sys-platform");
   if(m.device){
-    plat.textContent = (m.platform === "jetson" ? "Jetson" : "x86") + " · " + m.device;
+    plat.textContent = ({jetson:"Jetson", sbsa:"DGX Spark", dgpu:"x86"}[m.platform] || m.platform) + " · " + m.device;
     plat.hidden = false;
   }
   // `ram` is the memory the GPU draws from: the unified pool on Jetson, VRAM on a discrete card.
   // Same question, different name, so the legend follows the platform rather than picking one.
   const ramSeries = SERIES.find(x => x.key === "ram");
-  if(ramSeries) ramSeries.label = (m.platform === "jetson") ? "RAM" : "VRAM";
+  if(ramSeries) ramSeries.label = (m.platform === "dgpu") ? "VRAM" : "RAM";
   $("#sys-legend").innerHTML = SERIES.map(s=>`<span><i class="sw" style="background:var(${s.v})"></i>${s.label}</span>`).join("");
   lineChart($("#sys-chart"), m.history, SERIES);
   const c = m.current||{};
@@ -1011,7 +1161,7 @@ async function refreshSystem(){
     SERIES.map(s=>`<tr><td>${s.label}</td><td>${fmt(c[s.key])}%</td></tr>`).join("") +
     `<tr><td>Platform</td><td>${m.arch || "?"} · ${m.device || "?"}</td></tr>
      <tr><td>Telemetry</td><td>${m.backend || "?"}</td></tr>
-     <tr><td>${m.platform === "jetson" ? "RAM used" : "VRAM used"}</td><td>${fmt(c.ram_used_mb)} / ${fmt(c.ram_total_mb)} MB</td></tr>
+     <tr><td>${m.platform === "dgpu" ? "VRAM used" : "RAM used"}</td><td>${fmt(c.ram_used_mb)} / ${fmt(c.ram_total_mb)} MB</td></tr>
      <tr><td>Temp (tj)</td><td>${fmt(c.temp_tj)} °C</td></tr>
      <tr><td>Power</td><td>${fmt(c.power_mw)} mW</td></tr></table>`;
 }

@@ -130,12 +130,14 @@ case "${1:-}" in
     fi
 
     # REST + WebSocket control plane. Runs in the services venv (FastAPI/uvicorn live there, not
-    # in system python). Port 8080: 8000 and 8001 are the two model servers.
+    # in system python). Default 8080; 8000 and 8001 are the two model servers. Override with
+    # ISMS_API_PORT when the host already has something on 8080 (Label Studio does, on Spark).
+    API_PORT="${ISMS_API_PORT:-8080}"
     PIDS=$(api_pids); [ -n "$PIDS" ] && { echo "$PIDS" | xargs -r kill -9; sleep 1; }
-    nohup setsid "$VENV" services/api.py --port 8080 > "$APILOG" 2>&1 < /dev/null &
+    nohup setsid "$VENV" services/api.py --port "$API_PORT" > "$APILOG" 2>&1 < /dev/null &
     sleep 3
     if [ -n "$(api_pids)" ]; then
-      echo "==> API up on :8080  (docs: http://$(hostname):8080/docs)"
+      echo "==> API up on :${API_PORT}  (docs: http://$(hostname):${API_PORT}/docs)"
     else
       echo "!! API failed to start:"; tail -15 "$APILOG"
     fi
@@ -163,8 +165,9 @@ case "${1:-}" in
     [ -n "$RPIDS" ] && echo "reasoning svc : up (pid $(echo $RPIDS | tr '\n' ' '))" \
                     || echo "reasoning svc : down"
     APIDS=$(api_pids)
-    [ -n "$APIDS" ] && echo "api :8080     : up (pid $(echo $APIDS | tr '\n' ' '))" \
-                    || echo "api :8080     : down"
+    _api_port="${ISMS_API_PORT:-8080}"
+    [ -n "$APIDS" ] && echo "api :${_api_port}     : up (pid $(echo $APIDS | tr '\n' ' '))" \
+                    || echo "api :${_api_port}     : down"
     if [ -d data/clips ]; then
       echo "clips         : $(ls data/clips/*.mp4 2>/dev/null | wc -l) files, $(du -sh data/clips 2>/dev/null | cut -f1)"
     fi
