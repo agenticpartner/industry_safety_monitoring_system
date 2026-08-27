@@ -1,14 +1,19 @@
 # Industry Safety Operations Monitoring System
 
+This tree is the **NVIDIA DGX Spark** port of
+[atomicrajat/industry_safety_monitoring_system](https://github.com/atomicrajat/industry_safety_monitoring_system).
+The original project is a 20-camera PPE and fire pipeline; here the same system runs in Docker on
+GB10 (ARM SBSA, Blackwell), not as a host install.
+
 Real-time PPE compliance and fire/smoke detection across **20 concurrent 1080p30 camera streams**
-on a single NVIDIA Jetson AGX Orin. Detection, tracking, zone analytics, evidence clips,
-vision-language verification, a natural-language agent and phone alerts — all running on the edge
-device, with nothing leaving the box.
+on a single DGX Spark. Detection, tracking, zone analytics, evidence clips, vision-language
+verification, a natural-language agent and phone alerts — all on the box, with nothing leaving it.
 
 ![Operator dashboard — 20 cameras live, incident feed, KPIs](docs/images/dashboard.png)
 
 The operator dashboard: KPI tiles, the live 20-camera WebRTC wall with detections and zone
-overlays, the incident feed, and system utilisation — NVDEC at 99%, GPU at 92%.
+overlays, the incident feed, and system utilisation. Click a tile to fill the 1080p encode with
+that camera (`nvmultistreamtiler` `show-source`); the wall button restores the mosaic.
 
 ---
 
@@ -24,12 +29,12 @@ notification policy, it arrives on a phone with the video attached.
 |---|---|
 | **Detect** | Two YOLO detectors per frame: PPE (helmet / vest / person) and fire/smoke |
 | **Track** | NvSORT assigns stable per-person IDs so a single bad frame cannot flip a verdict |
-| **Reason about zones** | Per-camera polygons — a missing vest is `medium` in a walkway and `high` in a forklift route |
+| **Reason about zones** | Per-camera polygons — a missing vest is `medium` in a walkway and `high` in a forklift route. Live USB/IP cameras do not inherit the demo warehouse floor plan |
 | **Turn into incidents** | An event is a state *transition*, not a frame observation. 2225 observations → 6 incidents |
 | **Capture evidence** | An H.265 clip cut from the source at the incident timestamp, no re-encode |
-| **Verify** | A local VLM answers perception questions; the verdict is computed in code |
+| **Verify** | Cosmos Reason 2 answers perception questions; the verdict is computed in code |
 | **Alert** | Dashboard toast and alarm, plus Telegram with the clip — under a policy for what is worth interrupting someone for |
-| **Ask** | A local LLM answers questions over the incident database, grounded in SQL |
+| **Ask** | Nemotron Nano 9B answers questions over the incident database, grounded in SQL |
 
 ### An alert, end to end
 
@@ -48,42 +53,25 @@ can confirm the violation or mark it a false positive.</td>
 </tr>
 </table>
 
-### Measured, not estimated
+### Measured on this Spark
+
+Numbers below are from the live stack on the DGX Spark that runs this tree: 20 RTSP sources
+(`drop_frame_interval: 2` → 15 fps analytics per camera, **300 fps** needed to keep pace), full
+reasoning containers up, dashboard on `:9080`.
 
 | | |
 |---|---|
-| Throughput at 20 streams | **633.7 fps** against a 600 fps target (1.05×) |
-| With the full Phase 2 stack live | 509–519 fps against a 300 fps target (1.53–1.73×) |
-| Detection → visible on the dashboard | **0.27 s** median |
-| Detection → evidence clip ready | **2.11 s** median |
-| VLM verdict accuracy | 12/12 correct by eye, including two non-persons |
-| Cost of the event layer on the hot path | −0.9% |
-| Cost of zone analytics | none measurable |
-| Notification policy in practice | 30 incidents → 4 phone notifications |
+| Analytics target | **300 fps** (20 × 15) |
+| Pipeline aggregate (running average) | **~289 fps** — keeps up with the paced sources |
+| GPU (nvidia-smi snapshot) | **~94%** |
+| Stack | pipeline, events, clips, Cosmos Reason 2, Nemotron — all answering |
 
-Every figure has a script behind it and a file in [`bench/`](bench/) that records it. The
-`/system` page in the dashboard presents the same numbers with the architecture.
+File-mode decode-ceiling sweeps and alert-latency medians in [`bench/`](bench/) were recorded on
+the original hardware; they are not re-quoted here as Spark figures. Re-run those scripts on this
+box if you need Spark-specific ceilings.
 
-**Sizing note:** 20 streams at 1.05× is the demonstrated maximum, not the design point. For
-production, size at **16 cameras per Orin** (1.30× headroom).
-
-### On live RTSP cameras
-
-The figures above are file mode, run flat out — a ceiling. Live cameras pace the pipeline, so the
-question is whether it keeps up. Measured on 20 cameras over the LAN:
-
-| | |
-|---|---|
-| Detection → visible on the dashboard | **0.12 s** median (0.19 s p90) |
-| Detection → evidence clip ready | 11.1 s median |
-| VLM verdict | 22.9 s median, of which 6.7 s is inference |
-| Capacity, same configuration | **484.6 fps** against 300 needed — **1.6×** |
-| GPU, steady state | ~30% |
-
-**Realtime, with 1.6× headroom.** The analytics rate on this rig is ~190 fps against the ~290 the
-cameras send, and the gap is ingest rather than compute — 70% of the GPU is idle. Twenty TCP
-streams arrive from one host over one NIC and `nvstreammux` drops whatever misses its 40 ms batch
-window. Real cameras are separate devices, so that ceiling is the simulator's, not the Jetson's.
+Sources on this rig are restreamed from one host, so ingest can still drop a batch that misses
+the muxer window. Separate physical cameras do not share that NIC.
 
 ---
 
@@ -106,367 +94,56 @@ dashboard's `/system` page.
 
 ---
 
-## Hardware requirements
+## Hardware — DGX Spark
 
-Two platforms run on the host or in Docker. **Jetson** is the reference target and runs on the
-host. **x86_64 with a discrete NVIDIA GPU** and **DGX Spark (GB10, ARM SBSA)** run in Docker —
-see [Deploying on x86](#deploying-on-x86) and [Deploying on DGX Spark](#deploying-on-dgx-spark).
+Spark is **ARM SBSA**, not Tegra. There is no JetPack, no DLA, no `nv3dsink`, and the Tegra
+DeepStream image fails looking for `libnvbufsurface`. Do not treat `uname -m` → `aarch64` as a
+reason to install the Jetson stack.
 
-The platform-specific parts are detected, not assumed: power modes and locked clocks are Tegra
-tools and are skipped elsewhere, DLA exists only on Jetson, and the dashboard's system chart reads
-`tegrastats` on Jetson and `nvidia-smi` on a discrete card or Spark. `./scripts/check_hardware.sh`
-reports which platform it found. Do not treat "this is aarch64" as Jetson — Spark is aarch64 too.
+This deployment was checked on:
 
-| | Minimum | Reference platform |
-|---|---|---|
-| Board | Jetson Orin (any) | **AGX Orin 64 GB** |
-| JetPack / L4T | JetPack 6+ | JetPack 7.2.1 / L4T R39.2.1 |
-| DeepStream | 7.0+ | **9.1.0** |
-| TensorRT | 8.6+ | 10.16.2.10 |
-| RAM | 32 GB | 64 GB |
-| Free disk | 25 GB | 40 GB+ |
-| Python bindings | `pyservicemaker` | ships with DeepStream 9.x |
+| | This Spark |
+|---|---|
+| Chassis | NVIDIA DGX Spark (`NVIDIA_DGX_Spark` in DMI) |
+| GPU | NVIDIA GB10, compute **12.1** (`sm_121`) |
+| Driver / CUDA | **580.173.02** / **13.0** |
+| Memory | **128 GB** unified (`nvidia-smi memory.total` reports `[N/A]`; the dashboard charts system RAM, which is the pool the GPU draws from) |
+| DeepStream | **9.1.0** image `nvcr.io/nvidia/deepstream:9.1-triton-sbsa-dgx-spark` |
+| TensorRT | **10.16.1.11** (CUDA 13.2 packages inside that image) |
+| Display sink | `nveglglessink` |
+| llama.cpp | CUDA **13**, `CMAKE_CUDA_ARCHITECTURES=121` |
+| nvinfer | `strongly-typed: 1` (Blackwell) |
+| Subject crops | omitted (`WITH_RGB_CAPTURE=0`) — no CUDA torch in the image; the VLM uses context frames |
+| Dashboard | **`:9080`** (Label Studio typically already owns `:8080`) |
 
-On a smaller Orin (NX, Nano) everything runs — just lower `MAX_STREAMS`. The 20-stream figure is
-91% of the AGX Orin 64 GB NVDEC ceiling for 1080p30 H.265 and will not transfer.
-
-Check your box before installing anything:
+Need ~60 GB free for the image, ~11 GB of GGUF weights, engines, and clip budget. Disk on this
+host is not the constraint.
 
 ```bash
 ./scripts/check_hardware.sh
 ```
 
-It reports PASS / WARN / FAIL per item and exits non-zero if something is genuinely missing. Every
-check exists because getting it wrong produces a failure a long way from its cause.
+It reports PASS / WARN / FAIL and must identify the platform as **sbsa**, not Jetson.
 
 ---
 
-## Quick start — Jetson
+## Quick start
 
-A host install. For x86 see [Deploying on x86](#deploying-on-x86). For DGX Spark see
-[Deploying on DGX Spark](#deploying-on-dgx-spark) — that is a container, not this script.
+Docker and the NVIDIA Container Toolkit, with a GPU the toolkit can see:
+
+```bash
+nvidia-smi -L   # expect: NVIDIA GB10
+```
 
 ```bash
 git clone <your-fork-url> industry_safety_monitoring_system
 cd industry_safety_monitoring_system
 
-# 1. check the hardware, then install everything
-./scripts/setup.sh
+# Footage is gitignored. Copy cam01.mp4 … cam20.mp4 into media/, or build a set:
+#   ./scripts/docker_up.sh --profile media run --rm media
 
-# 2. add your own tokens  (see "Bring your own tokens" below)
+# Optional credentials (HF_TOKEN, Telegram) — see below
 cp .env.example .env && chmod 600 .env
-$EDITOR .env
-
-# 3. build the demo media set from your own footage
-cp /path/to/your/footage/*.mp4 media/src/
-./scripts/make_streams.sh 20
-
-# 4. detector weights -> ONNX -> TensorRT engines
-./build/venv-export/bin/python3 scripts/export_models.py all
-./scripts/build_engines.sh all
-
-# 5. optional: the local reasoning layer (VLM + agent LLM)
-./scripts/setup_reasoning.sh llamacpp --serve     # vision model on :8000
-./scripts/setup_reasoning.sh llm --serve          # agent LLM on :8001
-
-# 6. bring the whole demo up
-./scripts/demo_up.sh 20
-```
-
-Then open `http://<your-jetson>:8080/`.
-
-Steps 3 and 4 take a while — engine builds are several minutes each, and the reasoning layer
-compiles llama.cpp from source and downloads ~12 GB of weights. Steps 1–4 are the minimum for a
-working detection pipeline; step 5 is optional and everything degrades gracefully without it.
-
-### What `setup.sh` installs
-
-| | |
-|---|---|
-| System packages | ffmpeg, redis-server, **libmosquitto1**, cmake, build-essential |
-| `build/venv-export` | CPU torch + ultralytics + onnx — for `.pt` → ONNX only |
-| `build/venv-services` | FastAPI, uvicorn, redis, PyYAML — the API and services |
-| `build/venv-hf` | huggingface_hub — model downloads |
-| `build/bin/mediamtx` | RTSP / WebRTC / HLS republisher |
-| `models/parser/*.so` | the custom YOLO output parser that nvinfer loads |
-| `.env` | created from `.env.example`, `chmod 600` |
-| Performance mode | MAXN + `jetson_clocks` |
-
-`libmosquitto1` looks unrelated and is not optional: the DeepStream tracker `dlopen`s it, and
-without it the tracker fails to load with a message that names the tracker, not the library.
-
-Flags: `--check-only`, `--skip-apt`, `--no-perf-mode`, `--yes`. It is idempotent — re-run it
-freely.
-
----
-
-## Deploying on x86
-
-From nothing to a running system on any cloud GPU instance. Every step below was run on an L4.
-
-### 1. The instance
-
-Docker and the NVIDIA Container Toolkit, and a GPU the toolkit can see:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi -L
-```
-
-~60 GB of free disk: the image is ~33 GB, the model weights ~11 GB, and the clip budget 4 GB.
-
-DeepStream 9.1 documents driver 590+ for dGPU. Below that the container supplies its own newer
-user-mode driver through CUDA forward compatibility — measured working on 580.126.20 with an L4.
-
-### 2. Clone
-
-```bash
-git clone <your-fork-url> industry_safety_monitoring_system
-cd industry_safety_monitoring_system
-```
-
-### 3. Put the footage in place
-
-`media/` is gitignored, so a clone has none — the demo set is 454 MB and travels separately from
-the repository. Copy it to `media/` at the repo root:
-
-```bash
-rsync -avz --progress ./media/cam*.mp4 user@instance:industry_safety_monitoring_system/media/
-```
-
-The names are the contract. `media/cam01.mp4 … cam20.mp4`, and the number **is** the camera id
-that `configs/analytics/zones.yml`, the OSD label, the clip prefixes and the dashboard all key on
-— renumbering the files renames every camera. Each clip is 1920x1080, 30 fps, H.265.
-
-To build a set from your own footage instead, drop it in `media/src/` and:
-
-```bash
-docker compose -f docker/compose.yml --profile media run --rm media
-```
-
-That re-encodes whatever it finds into the 20-camera set, hardware-encoded through `hevc_nvenc`.
-With `media/src/` empty it falls back to the H.265 sample DeepStream ships, which contains no
-helmets, vests or fire — it satisfies the decode benchmark and nothing else.
-
-### 4. Credentials, if you want them — optional
-
-Nothing here needs a token. The model weights come from public GGUF repositories and download
-anonymously; `HF_TOKEN` is only for a gated repository, and Telegram alerts are off by default.
-
-If you do want either, the file has to exist **before** the containers are created:
-
-```bash
-cp .env.example .env && chmod 600 .env      # credentials
-$EDITOR .env
-```
-
-`env_file` is read at container *creation*, so a `.env` written afterwards needs
-`up -d --force-recreate app` — `restart` keeps the environment the container was built with.
-
-### 5. Run it — three modes
-
-Pick one. They differ only in where the video comes from; everything downstream — detection,
-tracking, zones, incidents, the VLM, the dashboard — is identical.
-
-| | source | evidence clips | use |
-|---|---|---|---|
-| **A** | files in `media/` | cut from the `.mp4` with `ffmpeg -c copy` | demos, benchmarks, repeatable numbers |
-| **B** | those same files, served as RTSP | `nvurisrcbin` smart record | exercising the live path with no cameras |
-| **C** | real cameras | `nvurisrcbin` smart record | production |
-
-#### A. Video files — the default
-
-```bash
-docker compose -f docker/compose.yml up -d --build
-```
-
-20 file sources from `media/`, run flat out. This is the mode to benchmark in: no network, no
-external host, repeatable.
-
-#### B. The same files, served as RTSP
-
-Publishes `media/` as 20 RTSP cameras on `:8654`, then points the pipeline at them:
-
-```bash
-ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
-  docker compose -f docker/compose.yml --profile sources up -d
-```
-
-This is the only way to exercise the live path — reconnection, TCP transport, smart-record
-evidence clips, subject crops — without cameras. The restreamers burn CPU beside the inference
-they feed, so throughput measured here describes a box doing both jobs;
-`scripts/serve_rtsp_sources.sh` explains why that is not a deployment topology.
-
-Sources are real-time paced, so 20 cameras at `drop_frame_interval: 2` produce 300 fps of
-analytics and the pipeline keeping pace at ~300 fps is the expected result, not a ceiling.
-
-#### C. Real cameras
-
-One URL per camera. **Position in the list is the camera id** that zones, the OSD label, the clip
-prefixes and the dashboard all key on:
-
-```bash
-ISMS_SOURCE=rtsp \
-ISMS_RTSP_URLS="rtsp://user:pw@10.0.0.11/Streaming/Channels/101,rtsp://user:pw@10.0.0.12/axis-media/media.amp" \
-  docker compose -f docker/compose.yml up -d
-```
-
-A fleet on one server with numbered mounts can use `ISMS_RTSP_BASE=rtsp://10.0.0.5:8554` instead,
-which fills in `cam01 … camNN` from `sources.rtsp_pattern`.
-
-Camera URLs come from the environment because they carry credentials and `configs/demo.yml` is
-committed — the same reason `HF_TOKEN` lives in `.env`.
-
-#### D. USB webcam in one slot
-
-The pipeline has no `v4l2` source — only `file://` and `rtsp://` — and it cannot mix the two in
-one run. Publish the webcam as RTSP, restream the demo files on the same MediaMTX, and **swap
-one of the twenty URLs**. Do not add a 21st stream: TensorRT engines are built for batch 20.
-
-On DGX Spark this was verified with `/dev/video0` (UVC, MJPEG 1280×720 @ 30fps → 1080p30 H.264)
-occupying **CAM 20**. Dashboard stays on **:9080**.
-
-```bash
-# 1. Persist RTSP mode + CAM 20 = webcam (docker/.env is gitignored)
-./scripts/serve_webcam.sh urls 20   # cam01..cam19 + rtsp://127.0.0.1:8654/webcam
-# Put that list in docker/.env as ISMS_RTSP_URLS, with ISMS_SOURCE=rtsp, ISMS_STREAMS=20,
-# and ISMS_RGB_CAPTURE=0 on Spark (no CUDA torch — RTSP would otherwise crash on subject crops).
-
-# 2. File restreamers on :8654, plus the webcam publisher
-./scripts/docker_up.sh --profile sources up -d
-
-# 3. Recreate the app so it picks up docker/.env (restart is not enough)
-./scripts/docker_up.sh up -d --force-recreate app
-```
-
-Wait until `docker logs -f isms-webcam-1` shows `-> rtsp://127.0.0.1:8654/webcam`, then:
-
-```bash
-ffprobe -rtsp_transport tcp rtsp://127.0.0.1:8654/webcam
-curl -s http://127.0.0.1:9080/health   # :8080 on x86 Docker
-```
-
-Refresh the dashboard; tile **CAM 20** is the live camera. The other 19 tiles are still the
-demo files, now pulled as RTSP (realtime-paced, not a decode-ceiling run).
-
-To go back to files only: set `ISMS_SOURCE=file` in `docker/.env`, then
-`./scripts/docker_up.sh --profile sources stop` and
-`./scripts/docker_up.sh up -d --force-recreate app`.
-
-#### Making a mode stick
-
-The commands above set the mode for one invocation. To make it the default for this deployment,
-put the same names in `docker/.env` (see `docker/.env.example`) and plain `docker compose up -d`
-uses them:
-
-```ini
-ISMS_SOURCE=rtsp
-ISMS_RTSP_BASE=rtsp://127.0.0.1:8654
-```
-
-Switching modes later means recreating the app container, not restarting it:
-
-```bash
-ISMS_SOURCE=file docker compose -f docker/compose.yml up -d --force-recreate app
-```
-
-### First boot, and watching it
-
-First boot builds the TensorRT engines against the GPU that is present (~8 minutes) and pulls
-~11 GB of model weights. Both land on named volumes, so every later start skips them.
-
-The reasoning containers are slow to arrive and nothing waits for them: the dashboard and the
-pipeline come up immediately, and the reasoning layer joins when the VLM answers. Until then
-incidents read `unverified`.
-
-```bash
-curl -s localhost:8080/health                       # every component, one line
-docker compose -f docker/compose.yml logs -f app    # engine build, then the pipeline
-docker compose -f docker/compose.yml --profile sources down   # stop; volumes survive
-```
-
-
-### What runs
-
-Four containers on host networking, so `configs/services.yml` keeps addressing `127.0.0.1` and one
-set of configs stays correct on both platforms.
-
-| | |
-|---|---|
-| `redis` | the event bus |
-| `app` | pipeline, services, dashboard, mediamtx |
-| `vlm` | Cosmos Reason 2 on `:8000`, adjudicates incidents |
-| `llm` | Nemotron Nano 9B on `:8001`, answers questions |
-
-Everything except the dashboard (`:8080`) and mediamtx's RTSP and WebRTC listeners (`:8554`,
-`:8889`) binds loopback. Those three are what a browser reaches, and there is no authentication in
-front of them.
-
-Three things are not in the image. **Engines** are specific to the GPU, driver and TensorRT that
-built them, so they are built on first boot and stamped with the compute capability that did it;
-moving the volume to another card rebuilds. **Media** is mounted. **Model weights** are pulled to a
-volume. ONNX *is* baked, from a separate build stage — it is architecture-independent.
-
-### Configuration
-
-**File mode is the default.** `docker compose up -d` with nothing else set runs 20 file sources
-from `media/`; RTSP is opt-in.
-
-Two env files, with different jobs, because Compose treats them differently:
-
-| | |
-|---|---|
-| `docker/.env` | what the deployment **is** — source mode, stream count, camera addresses. Compose reads it to substitute `${...}` in `compose.yml`, and looks for it beside the compose file. Template: `docker/.env.example` |
-| `<repo>/.env` | **credentials**, injected into the containers by `env_file`. The same file `scripts/env.sh` sources on the Jetson. Template: `.env.example` |
-
-An `ISMS_*` value in the repo-root `.env` does not work: Compose interpolates from `docker/`, and
-the `environment:` block then overrides whatever `env_file` supplied. It fails silently and the
-deployment runs with the default. Either use `docker/.env`, or set it on the command line.
-
-Settings, in `docker/.env` or per-command:
-
-| | |
-|---|---|
-| `ISMS_STREAMS` | cameras, default 20 |
-| `ISMS_SOURCE` | `file` or `rtsp` |
-| `ISMS_RTSP_URLS` | comma-separated per-camera URLs; position is the camera id |
-| `ISMS_RTSP_BASE` | camera server, overrides `sources.rtsp_base` |
-| `ISMS_WIPE` | wipe previous incidents on start, default 1 |
-| `ISMS_API_PORT` | dashboard/API port, default 8080; Spark overlay uses **9080** (Label Studio keeps 8080) |
-| `ISMS_RGB_CAPTURE` | subject crops; unset follows the source mode — on for `rtsp`, off for `file` |
-| `CUDA_ARCHS` | compute capabilities llama.cpp is built for, default `80;86;89;90` (Spark overlay: `121`) |
-
-Subject crops need CUDA torch in the image, ~3.5 GB; `--build-arg WITH_RGB_CAPTURE=0` leaves it
-out and the VLM falls back to context frames. Only RTSP needs it — in file mode the crop is cut
-from the source `.mp4` at the incident PTS.
-
-### Measured on an L4
-
-24 GB VRAM, 20 streams, `drop_frame_interval: 2`, zones and events on, full reasoning stack up.
-
-| | file sources | 20 RTSP cameras |
-|---|---|---|
-| Throughput | **616 fps** flat out | **301 fps**, keeping pace with 20 real-time cameras |
-| Cost of the reasoning layer | -0.5% | |
-| VRAM | | **15631 MiB of 23034** - 7028 LLM, 5620 VLM, 2948 pipeline |
-| VLM verdict | | 3.2-6.2 s PPE, 8.0-9.5 s overcrowding |
-
-Engine throughput is 1869 inf/s for PPE and 801 inf/s for fire, against budgets of 300 and 100.
-
----
-
-## Deploying on DGX Spark
-
-DGX Spark is ARM SBSA (GB10), not Jetson. There is no JetPack, no DLA, no `nv3dsink`, and the
-Tegra DeepStream image will not run — it fails looking for `libnvbufsurface`. Use the Docker path
-with the Spark overlay. `./scripts/docker_up.sh` detects the host and adds it for you.
-
-```bash
-git clone <your-fork-url> industry_safety_monitoring_system
-cd industry_safety_monitoring_system
-
-# Footage still lives on the host (gitignored). Copy cam01.mp4 … cam20.mp4 into media/,
-# or build a set:
-#   docker compose -f docker/compose.yml -f docker/compose.spark.yml --profile media run --rm media
 
 ./scripts/docker_up.sh
 ```
@@ -477,257 +154,252 @@ That is:
 docker compose -f docker/compose.yml -f docker/compose.spark.yml up --build -d
 ```
 
-Then `http://<spark>:9080/` (not 8080 — Label Studio already owns that port on a typical Spark
-desktop). First boot pulls the SBSA DeepStream image, builds TensorRT engines
-for sm_121, and compiles llama.cpp with CUDA 13 / `CMAKE_CUDA_ARCHITECTURES=121`. CUDA 12.6
-cannot produce GB10 kernels — a binary built for 80;86;89;90 will load and then fail every
-launch.
+Then **http://\<spark\>:9080/**.
 
-What the overlay changes, and why:
+First boot pulls the SBSA DeepStream image, builds TensorRT engines for `sm_121`, and compiles
+llama.cpp with CUDA 13. A binary built for `80;86;89;90` under CUDA 12.6 will load on GB10 and
+then fail every kernel launch.
 
-| | x86 | DGX Spark |
-|---|---|---|
-| DeepStream image | `9.1-samples-multiarch` | `9.1-triton-sbsa-dgx-spark` |
-| Display sink | `nveglglessink` | `nveglglessink` (not `nv3dsink`) |
-| llama.cpp CUDA | 12.6, archs 80;86;89;90 | 13.0, arch **121** |
-| nvinfer | weakly typed | `strongly-typed: 1` (Blackwell) |
-| Subject-crop torch | pip cu126 | omitted — VLM uses context frames |
+`scripts/setup.sh` is the original host-install path. Do not run it on Spark expecting DeepStream
+to appear on the host — it arrives in the SBSA container.
 
-The rest of the stack is the same as [Deploying on x86](#deploying-on-x86): host networking,
-named volumes for engines and weights, file/RTSP source modes, `docker/.env` for stream count
-and camera URLs. Unified memory on Spark makes `nvidia-smi memory.total` report `[N/A]`; the
-dashboard chart then uses system RAM, which is the pool the GPU actually draws from.
+### Put the footage in place
 
-Do **not** run `scripts/setup.sh` on Spark expecting a Jetson-style host install. DeepStream
-arrives in the SBSA container.
+`media/` is gitignored. Names are the contract: `media/cam01.mp4 … cam20.mp4`, and the number
+**is** the camera id that `configs/analytics/zones.yml`, the OSD label, the clip prefixes and the
+dashboard all key on. Each clip is 1920×1080, 30 fps, H.265.
 
-### Live webcam as CAM 20 (verified on this Spark)
+To build a set from your own footage, drop it in `media/src/` and:
 
-The stack does not ingest `/dev/video0` directly. These are the steps that worked here:
+```bash
+./scripts/docker_up.sh --profile media run --rm media
+```
 
-1. Confirmed `/dev/video0` is a UVC capture node (MJPEG up to 4K; `/dev/video1` is not capture).
-2. Encoded a 3 s test inside `isms:sbsa`: MJPEG 1280×720 @ 30fps, scaled to 1920×1080, `libx264
-   -tune zerolatency` — ~30 fps, no dropped device.
-3. Wrote `docker/.env` with `ISMS_SOURCE=rtsp`, `ISMS_STREAMS=20`, and `ISMS_RTSP_URLS` from
-   `./scripts/serve_webcam.sh urls 20` (slots 1–19 = `…/camNN`, slot 20 = `…/webcam`).
-4. `./scripts/docker_up.sh --profile sources up -d` — MediaMTX on **:8654** restreams `media/`,
-   and the `webcam` service publishes `rtsp://127.0.0.1:8654/webcam` (host network +
-   `/dev/video0`; host `ffmpeg` is not required).
-5. `./scripts/docker_up.sh up -d --force-recreate app` so the app actually reads `docker/.env`.
-   `restart` keeps the old file-mode environment.
-6. Spark has no CUDA torch in the image, so `ISMS_RGB_CAPTURE=0` (also set by the Spark overlay).
-   Without it, RTSP autostart enables subject crops and the pipeline dies on `import torch`.
+That re-encodes through `hevc_nvenc`. With `media/src/` empty it falls back to the H.265 sample
+DeepStream ships, which contains no helmets, vests or fire.
 
-Then `http://<spark>:9080/` — **CAM 20** is the webcam. Do not publish the camera to **:8554**;
-that port is the tiled *output*. Leave engines at batch 20. Same commands as [mode D](#d-usb-webcam-in-one-slot).
+### Three source modes
+
+They differ only in where the video comes from.
+
+| | Source | Evidence clips | Use |
+|---|---|---|---|
+| **A** | files in `media/` | `ffmpeg -c copy` from the `.mp4` | demos, repeatable numbers |
+| **B** | those files, served as RTSP | `nvurisrcbin` smart record | live path, no cameras |
+| **C** | real cameras (and/or a USB webcam) | smart record | production / this Spark |
+
+#### A. Video files
+
+```bash
+./scripts/docker_up.sh up -d --build
+```
+
+20 file sources from `media/`, run flat out.
+
+#### B. The same files, as RTSP
+
+```bash
+ISMS_SOURCE=rtsp ISMS_RTSP_BASE=rtsp://127.0.0.1:8654 \
+  ./scripts/docker_up.sh --profile sources up -d
+```
+
+Realtime-paced: 20 cameras at `drop_frame_interval: 2` need 300 fps of analytics; keeping pace
+near 300 fps is the expected result, not a ceiling. Recreate the app after changing `docker/.env`
+(`restart` keeps the old environment):
+
+```bash
+./scripts/docker_up.sh up -d --force-recreate app
+```
+
+#### C. Real cameras
+
+Position in the list **is** the camera id:
+
+```bash
+ISMS_SOURCE=rtsp \
+ISMS_RTSP_URLS="rtsp://user:pw@10.0.0.11/Streaming/Channels/101,rtsp://user:pw@10.0.0.12/axis-media/media.amp" \
+  ./scripts/docker_up.sh up -d --force-recreate app
+```
+
+A fleet on one server with numbered mounts can use `ISMS_RTSP_BASE` instead. Camera URLs live in
+the environment because they carry credentials and `configs/demo.yml` is committed.
+
+Physical cameras (USB webcam path `/webcam`, `v4l2`, or an IP `rtsp://` that is not a numbered
+demo restream) do not get the warehouse aisle OSD — those polygons were authored for the demo
+clips.
+
+#### USB webcam as CAM 20 (verified on this Spark)
+
+The pipeline does not ingest `/dev/video0` directly. `./scripts/serve_webcam.sh` publishes it as
+`rtsp://127.0.0.1:8654/webcam`.
+
+```bash
+# docker/.env: ISMS_SOURCE=rtsp, ISMS_STREAMS=20, ISMS_RGB_CAPTURE=0,
+# ISMS_RTSP_URLS from:
+./scripts/serve_webcam.sh urls 20
+
+./scripts/docker_up.sh --profile sources up -d
+./scripts/docker_up.sh up -d --force-recreate app
+```
+
+Do not publish the camera to **:8554** — that is the tiled *output*. Leave TensorRT batch at 20;
+do not add a 21st stream.
+
+`ISMS_RGB_CAPTURE` must stay **0**. Unset on RTSP would turn subject crops on and the pipeline
+dies on `import torch`.
+
+### What runs
+
+Four containers on **host networking**, so `configs/services.yml` still talks to `127.0.0.1`.
+
+| | |
+|---|---|
+| `redis` | the event bus |
+| `app` | pipeline, services, dashboard, mediamtx |
+| `vlm` | Cosmos Reason 2 on `:8000` |
+| `llm` | Nemotron Nano 9B on `:8001` |
+
+The browser reaches the dashboard (`:9080`) and mediamtx (`:8554` RTSP, `:8889` WebRTC). There is
+no authentication in front of them.
+
+Engines are built on first boot and stamped with compute 12.1. Weights land on a named volume.
+ONNX is baked in the image.
+
+### Configuration knobs
+
+Two env files, because Compose treats them differently:
+
+| File | Job |
+|---|---|
+| `docker/.env` | What the deployment **is** — source mode, stream count, camera URLs. Template: `docker/.env.example` |
+| `<repo>/.env` | Credentials, via `env_file`. Template: `.env.example` |
+
+An `ISMS_*` value in the repo-root `.env` does not work: Compose interpolates from `docker/`.
+
+| | |
+|---|---|
+| `ISMS_STREAMS` | cameras, default 20 |
+| `ISMS_SOURCE` | `file` or `rtsp` |
+| `ISMS_RTSP_URLS` | comma-separated; position is the camera id |
+| `ISMS_RTSP_BASE` | numbered mounts |
+| `ISMS_WIPE` | wipe incidents on start, default 1 |
+| `ISMS_RGB_CAPTURE` | **0** on Spark |
+| `ISMS_API_PORT` | overlay sets **9080** |
 
 ---
 
-
 ## Bring your own tokens
 
-**Nothing in this repository ships with credentials, and no feature falls back to somebody else's
-account.** You supply your own. Copy the template and fill it in:
+Nothing ships with credentials. Copy the template if you want Hugging Face or Telegram:
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 ```
 
-`.env` is gitignored and must stay that way.
+`.env` is gitignored. The file is optional — without it those features stay off. `env_file` is
+read at container **creation**; a `.env` written afterwards needs
+`./scripts/docker_up.sh up -d --force-recreate app`.
 
-The same file, the same place, on both platforms. On Jetson `scripts/env.sh` sources it; on x86
-`docker/compose.yml` reads it into the containers that need it. It is optional in both cases —
-without it the features that need a token stay off. The image itself ships no `.env`, so nothing
-in it can overwrite yours.
+The reasoning layer on Spark serves public GGUF builds
+(`robertzty/Cosmos-Reason2-2B-GGUF`, `bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`) and
+downloads anonymously. `HF_TOKEN` is only needed for a gated repo.
 
-On x86 the reasoning layer needs no token at all: it serves quantised GGUF builds
-(`robertzty/Cosmos-Reason2-2B-GGUF`, `bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`), both
-public, and `hf_hub_download` is called with no token when the variable is unset. The 11 GB pull
-on this deployment ran anonymously. `HF_TOKEN` matters for the Jetson path, which can fetch
-`nvidia/Cosmos-Reason2-2B` itself, and that repository is gated.
+### Hugging Face
 
-### Hugging Face token
+1. <https://huggingface.co/settings/tokens> — **read** scope
+2. `HF_TOKEN=hf_...` in `.env`
 
-Needed only for the optional reasoning layer, which downloads the vision and language model
-weights. The detector models are public and need no token.
+### Telegram (off by default)
 
-1. Go to <https://huggingface.co/settings/tokens>
-2. Create a token with **read** scope — that is enough
-3. Put it in `.env` as `HF_TOKEN=hf_...`
+1. [@BotFather](https://t.me/BotFather) `/newbot`
+2. `./scripts/telegram_setup.sh` or `getUpdates` for the chat id
+3. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` in `.env`
+4. `notify.telegram.enabled: true` in `configs/services.yml`
+5. Recreate the app container
 
-### Telegram bot token and chat id
-
-Needed only if you enable phone alerts. They are **off by default** — an alert pushed to someone's
-phone cannot be unsent, so turning them on is a deliberate act.
-
-1. Message [@BotFather](https://t.me/BotFather) in Telegram, send `/newbot`, copy the token
-2. Add the bot to a group, or just send it a direct message
-3. Get the chat id — either let the helper find it:
-   ```bash
-   ./scripts/telegram_setup.sh
-   ```
-   or do it by hand:
-   ```bash
-   curl "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
-   ```
-   and read `.result[].message.chat.id` out of the response
-4. Put both in `.env`:
-   ```
-   TELEGRAM_BOT_TOKEN=...
-   TELEGRAM_CHAT_ID=...
-   ```
-5. Turn the feature on in `configs/services.yml`:
-   ```yaml
-   notify:
-     telegram:
-       enabled: true
-   ```
-6. Restart: `./scripts/demo_up.sh --down && ./scripts/demo_up.sh`
-
-Check it with `curl http://localhost:8080/notify/status`, and preview the policy without sending
-anything using `notify_service.py --dry-run`.
-
-Credentials are read from a file rather than your shell profile on purpose: Ubuntu's default
-`.bashrc` returns early for non-interactive shells, so an `export` there is invisible to exactly
-the systemd, `nohup` and `ssh host 'cmd'` invocations that need it.
+Check with `curl http://localhost:9080/notify/status`.
 
 ---
 
 ## Running it
 
-### The one command
-
 ```bash
-./scripts/demo_up.sh          # wipe previous incidents, 20 streams, live view on
-./scripts/demo_up.sh 12       # 12 streams
-./scripts/demo_up.sh 20 --keep    # keep existing incidents instead of wiping
-./scripts/demo_up.sh --down   # stop everything
+./scripts/docker_up.sh                         # start (adds compose.spark.yml on this host)
+./scripts/docker_up.sh --profile sources up -d # + restreamers / webcam
+./scripts/docker_up.sh --profile sources down  # stop; volumes survive
 ```
 
-Wiping is the default because the usual reason to restart is to show the system detecting things
-live, and a feed pre-filled with an old run makes new alerts impossible to pick out.
-
-`--down` deliberately **leaves the two model servers running** on :8000 and :8001. They cost
-nothing when idle (measured: 517.8 fps at 20 streams with both loaded, identical to baseline) and
-take minutes to reload. To free their ~12 GB as well: `pkill -x llama-server`.
-
-### Where to look
+Pause/resume from the dashboard header stops the pipeline process (SIGKILL — TensorRT unloads)
+without unloading Cosmos or Nemotron.
 
 | | |
 |---|---|
-| Dashboard | `http://<jetson>:8080/` |
-| System reference | `http://<jetson>:8080/system` |
-| Live flow | `http://<jetson>:8080/flow` |
-| API browser | `http://<jetson>:8080/docs` |
-| Tiled wall (RTSP) | `rtsp://<jetson>:8554/safety` |
-| Live view (WebRTC) | `http://<jetson>:8889/safety` |
-| Service logs | `logs/` |
+| Dashboard | `http://<spark>:9080/` |
+| System reference | `http://<spark>:9080/system` |
+| Live flow | `http://<spark>:9080/flow` |
+| API browser | `http://<spark>:9080/docs` |
+| Tiled wall (RTSP) | `rtsp://<spark>:8554/safety` |
+| Live view (WebRTC) | `http://<spark>:8889/safety` |
+| Logs | `docker compose … logs -f app` and `logs/` in the app volume |
 
 ### Timing to expect
 
-An alert appears in **under a second**. Its evidence clip follows in **2–3 s**. The VLM verdict
-takes **5–10 s per incident and runs serially**, so a cold start (~30 incidents in the first 40 s)
-takes a few minutes to fully adjudicate. That is queueing, not a stall — in steady state incidents
-arrive as transitions and the adjudicator keeps up easily.
-
-### Real cameras instead of files
-
-Set `pipeline.source_mode: rtsp` and list the cameras:
-
-```yaml
-sources:
-  rtsp_urls:
-    - rtsp://user:pw@10.0.0.11/Streaming/Channels/101      # Hikvision
-    - rtsp://user:pw@10.0.0.12/axis-media/media.amp        # Axis
-    - rtsp://10.0.0.13:554/cam/realmonitor?channel=1&subtype=0   # Dahua
-```
-
-List position is the camera id — zones, the OSD and clip names all key on it. An empty
-`rtsp_urls` falls back to `rtsp_base` + `rtsp_pattern`, the demo's numbered mounts on one server.
-
-`sources.rtsp` carries reconnect, TCP transport and a 200 ms jitterbuffer. Reconnect is the one
-that matters: `nvurisrcbin` defaults it to *never*, so a camera that blips goes black until the
-pipeline restarts.
-
-The simulator from earlier serves the same purpose here, from another machine:
-
-```bash
-./scripts/serve_rtsp_sources.sh start 20   # prints the rtsp_base line to paste in
-```
-
-It loops a compressed stream, which restarts the GOP and occasionally makes the fire detector
-fire on decode smear — an artifact of the simulator, not the detector. The same footage in file
-mode detects nothing.
+An alert appears in **under a second**. Its evidence clip follows after the smart-record window
+(on the order of **10 s** in RTSP mode, because the tail has to elapse). The VLM verdict runs
+**serially** — a cold start queue takes a few minutes to drain; steady state keeps up.
 
 ### Evidence over RTSP
 
-There is no local source file, so both come off the pipeline:
+There is no local source file:
 
-- **Clips** — `nvurisrcbin` smart record, straight from its ring buffer. Full source frame rate,
-  no re-encode. Slower to appear than file mode (11 s vs 2 s) because the window has to elapse.
-- **Subject crops** — captured in the probe at the moment of detection, behind a valve that
-  costs nothing when idle (484.6 → 481.3 fps at 20 streams). Needs torch:
-
-```bash
-python3 -m venv --system-site-packages build/venv-pipeline   # sees system pyservicemaker
-build/venv-pipeline/bin/pip install torch
-build/venv-pipeline/bin/python3 app/safety_pipeline.py --source rtsp --rgb-capture ...
-```
-
-Without `--rgb-capture` the VLM falls back to context frames — weaker, but no extra dependency.
+- **Clips** — `nvurisrcbin` smart record from its ring buffer, no re-encode.
+- **Subject crops** — not in this image. The VLM uses context frames instead.
 
 ---
 
-## Configuration
+## Pipeline config
 
-Two files, split by lifecycle. The pipeline gets restarted constantly during tuning; the services
-are meant to stay up.
+Two files, split by lifecycle.
 
-### `configs/demo.yml` — the pipeline
+### `configs/demo.yml`
 
 | Knob | What it does |
 |---|---|
-| `pipeline.streams` | 1–20. How many cameras. |
-| `pipeline.source_mode` | `file` (benchmarking — repeatable) or `rtsp` (demo) |
-| `pipeline.drop_frame_interval` | `2` = 15 fps analytics. **This is what makes the local reasoning layer affordable.** |
-| `pipeline.topology` | `serial` (default) or `parallel` (only pays off with a DLA-resident model) |
-| `rules.*.min_confidence` | Per-rule thresholds. **Never stricter than the detector's own `pre-cluster-threshold`.** |
-| `rules.window_frames` / `flip_ratio` | Debouncing — how many frames must agree before a verdict flips |
+| `pipeline.streams` | 1–20 |
+| `pipeline.source_mode` | `file` or `rtsp` |
+| `pipeline.drop_frame_interval` | `2` = 15 fps analytics. This is what makes the local reasoning layer affordable |
+| `pipeline.topology` | `serial` (Spark has no DLA; `parallel` does not pay off) |
+| `rules.*.min_confidence` | Never stricter than the detector's `pre-cluster-threshold` |
+| `rules.window_frames` / `flip_ratio` | Debouncing |
 | `sinks.display` / `sinks.rtsp_out` | Local monitor and/or network output |
-| `render.compute_hw` | `gpu`. The Jetson default is VIC, which costs 33% throughput. |
+| `render.compute_hw` | `gpu` |
 
-### `configs/services.yml` — everything downstream
+### `configs/services.yml`
 
-Redis, the incident store (including `realert_after_s`, which re-raises incidents left open too
-long), clip retention and disk budget, the reasoning endpoint, and the notification policy —
-`always_types`, `confirmed_types`, `min_severity`, rate limits.
+Redis, the incident store (`realert_after_s`), clip retention, the reasoning endpoints, and the
+notification policy.
 
 ### The rest
 
 `configs/pgie_ppe.yml` and `pgie_fire.yml` are the detectors. `tracker_nvsort_tuned.yml` is the
 tracker — **do not point this at the stock `config_tracker_NvSORT.yml`**, which emits zero objects
 while appearing to run faster. `analytics/zones.yml` is the zone geometry;
-`scripts/make_zones.py --preview N` renders the polygons onto a real frame so you can check them
-by eye.
+`scripts/make_zones.py --preview N` renders polygons onto a real frame.
 
-Full reasoning behind every value is in [`project_skill.md`](project_skill.md).
+Full field notes: [`project_skill.md`](project_skill.md).
 
 ---
 
 ## Tests
 
 ```bash
-./tests/run_all.sh            # everything that can run on this machine
+./tests/run_all.sh            # everything that can run without a GPU
 ./tests/run_all.sh --logic    # only the dependency-free tests
 ```
 
-Nothing in `tests/` talks to a network, a model server, a GPU or a real Redis. `test_rules.py` and
-`test_events.py` need no dependencies at all and run on a laptop — that is deliberate, because the
-code that decides whether a worker is compliant is the part most likely to be subtly wrong and
-should not need a Jetson and a video feed to check. See [`tests/README.md`](tests/README.md).
-
-To validate a live incident database against the store's invariants:
+Nothing in `tests/` talks to a network, a model server, a GPU or a real Redis. See
+[`tests/README.md`](tests/README.md).
 
 ```bash
 python3 tools/inspect_db.py --check-only
@@ -743,13 +415,11 @@ Downloaded at setup time, not committed.
 |---|---|---|---|
 | PPE / helmet / vest | YOLOv11n, 4 classes | `melihuzunoglu/ppe-detection` | AGPL-3.0 |
 | Fire / smoke | YOLOv26s | `SalahALHaismawi/yolov26-fire-detection` | MIT |
-| Vision verification | Cosmos Reason 2 (2B) | `nvidia/Cosmos-Reason2-2B` | NVIDIA Open Model |
+| Vision verification | Cosmos Reason 2 (2B) | NVIDIA Open Model (GGUF on Spark) | NVIDIA Open Model |
 | Agent | Nemotron Nano 9B v2 | NVIDIA | NVIDIA Open Model |
 
-The PPE model has **no `no-vest` class**, so a vest violation is inferred — "a person with no
-overlapping vest box". The UI reflects the difference in evidence strength: `NO HELMET` is
-upper-case and definite, `no vest?` is lower-case and hedged. Helmet detection is direct and is
-the trustworthy signal.
+The PPE model has **no `no-vest` class**, so a vest violation is inferred. The UI reflects that:
+`NO HELMET` is definite, `no vest?` is hedged.
 
 ---
 
@@ -757,54 +427,50 @@ the trustworthy signal.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Pipeline runs fast, zero detections | Stock NvSORT config — `minTrackerConfidence` is unreachable without a visual tracker, so every target sits in shadow mode | Use `configs/tracker_nvsort_tuned.yml` |
-| `Failed to initilaize low level lib` | The tracker `dlopen`s libmosquitto | `sudo apt install libmosquitto1` |
-| `setDimensions: Error Code 3` | Dynamic-axis ONNX without explicit dims | `infer-dims=3;640;640` in the nvinfer config |
-| `nv3dsink: no display found` | Wrong X display number | Auto-detected by `scripts/env.sh`; pin with `DISPLAY_NUM` in `.env` |
-| `Could not get EGL display connection`, then `nvinfer ... Failed to set buffer pool to active` | `DISPLAY` points at an X server this user cannot reach — often the login-screen greeter. The error names nvinfer but the model is fine | Leave `DISPLAY` **unset** and run headless; `scripts/env.sh` now probes with `xdpyinfo` and only exports a display that answers |
-| Pipeline deadlocks in PAUSED, no error | A sink missing `async=0` with a `tee` in the graph | Set `async=0` on every sink |
-| Black video box in the dashboard | Three different causes | `curl localhost:8080/live/status` — it names which one and the next action |
-| Evidence clip plays as a black rectangle | Browsers cannot decode H.265 | Already handled — `/clips/{id}` transcodes lazily. Check `logs/api.log` |
-| Agent answers slowly, always with the same plan | The soft fallback is firing | Check `plan_error` in the response |
-| `database is locked` | A write from a read path, or an uncommitted empty transaction | See `project_skill.md` §6, traps 23 and 27 |
-| Throughput varies wildly between runs | Clocks not locked, or a previous pipeline still alive | `sudo jetson_clocks`; `ps -eo args \| grep '[s]afety_pipeline'` |
+| Pipeline runs fast, zero detections | Stock NvSORT — every target sits in shadow mode | `configs/tracker_nvsort_tuned.yml` |
+| `Failed to initilaize low level lib` | Tracker `dlopen`s libmosquitto | Already in the Spark image; do not debug this as a pipeline bug |
+| `setDimensions: Error Code 3` | Dynamic-axis ONNX without dims | `infer-dims=3;640;640` |
+| `libnvbufsurface` missing | Tegra DeepStream image on Spark | Use `compose.spark.yml` / `./scripts/docker_up.sh` |
+| llama.cpp loads then every kernel fails | Built for sm_80–90 / CUDA 12.6 | Overlay builds CUDA 13 / arch **121** |
+| Pipeline dies on `import torch` | Subject crops on, no CUDA torch | `ISMS_RGB_CAPTURE=0` |
+| Dashboard empty on `:8080` | Label Studio owns that port | Use **`:9080`** |
+| Black video in the dashboard | Encode / mediamtx / pipeline | `curl localhost:9080/live/status` |
+| Evidence clip is a black rectangle | Browser cannot decode H.265 | `/clips/{id}` transcodes lazily |
+| Agent always the same plan, slow | Soft fallback | Check `plan_error` in the response |
+| `database is locked` | Write on a read path | `project_skill.md` §6, traps 23 and 27 |
+| Empty wall after `down` | Restreamers on `:8654` were stopped | `./scripts/docker_up.sh --profile sources up -d` then recreate `app` |
 
-The full trap list — 67 verified behaviours, several of which contradict the SDK docs — is in
-[`project_skill.md`](project_skill.md) §6.
+The full trap list is in [`project_skill.md`](project_skill.md) §6.
 
 ---
 
 ## Repository layout
 
 ```
-app/            the DeepStream pipeline and the rules that turn detections into events
-services/       everything downstream: store, clips, VLM, agent, API, alerts
-tools/          operator utilities — database integrity, verdict inspection
-tests/          unit tests, none of which need hardware
-scripts/        setup, build, run, and measurement
+app/            DeepStream pipeline and the rules that turn detections into events
+services/       store, clips, VLM, agent, API, alerts
+tools/          database integrity, verdict inspection
+tests/          unit tests, none of which need a GPU
+scripts/        docker_up, media, webcam, measurement
 configs/        pipeline, model, tracker, zone and service configuration
-dashboard/      the operator UI and the developer reference page
-models/         label files and the custom TensorRT output parser
-bench/          measured results — the source for every number quoted anywhere
+dashboard/      operator UI
+models/         labels and the custom TensorRT output parser
+bench/          measured results (includes original-tree sweeps)
 requirements/   Python dependencies, one file per virtualenv
-docker/         the x86 images, compose file and entrypoints
-.claude/skills/ 28 NVIDIA agent skills (DeepStream, Jetson, VSS)
+docker/         Spark overlay (`compose.spark.yml`), images, entrypoint
+.claude/skills/ NVIDIA agent skills (DeepStream, VSS, …) shipped unmodified
 ```
 
 ---
 
 ## For AI coding assistants
 
-Two things are here for you:
+**[`project_skill.md`](project_skill.md)** — architecture, settled constraints, and field notes.
+Read it before changing the pipeline.
 
-**[`project_skill.md`](project_skill.md)** — the compiled state of the project. Architecture, every
-measured number with the script behind it, the settled constraints, 66 verified field notes, and
-where the system is built to grow. Read it before changing anything.
-
-**[`.claude/skills/`](.claude/skills/)** — 28 NVIDIA agent skills covering DeepStream development,
-Jetson tuning and the VSS platform, with exact API and property references. Read the relevant
-skill's reference docs before generating pipeline code; they contain the precise property names
-that guesswork gets wrong.
+**[`.claude/skills/`](.claude/skills/)** — NVIDIA DeepStream / VSS reference material with exact
+property names. This host is **SBSA / DGX Spark**, not Tegra: do not emit Jetson-only plugins
+(`nv3dsink`, DLA, `nvarguscamerasrc`) or treat `aarch64` as Jetson.
 
 ---
 
@@ -814,5 +480,6 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 
 The PPE detector is a YOLOv11 model and the export path uses Ultralytics, both AGPL-3.0, which is
 why this project is too. The NVIDIA agent skills under `.claude/skills/` are NVIDIA's own work
-under their own terms (Apache-2.0 / CC-BY-4.0 / MIT — each skill's `skill-card.md` says which) and
-are **not** covered by the AGPL. Full attribution in [NOTICE](NOTICE).
+under their own terms and are **not** covered by the AGPL. Full attribution in [NOTICE](NOTICE).
+
+Upstream: [atomicrajat/industry_safety_monitoring_system](https://github.com/atomicrajat/industry_safety_monitoring_system).

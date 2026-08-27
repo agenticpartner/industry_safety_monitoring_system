@@ -1,8 +1,11 @@
 # Benchmarks
 
-Measured results. Every performance number quoted in the dashboard, the `/system` page,
-`README.md` and `project_skill.md` comes from a file in here, and every file in here was produced
-by a script in `scripts/`.
+Measured results. The [root README](../README.md) quotes **DGX Spark** figures taken from the
+live stack on this host. Files in this folder include the original-tree sweeps; re-run the
+scripts on Spark if you need a Spark-specific ceiling rather than reusing those rows.
+
+Every other performance number in the dashboard, `/system`, and `project_skill.md` still traces
+to a file here and a script in `scripts/`.
 
 ## Reports
 

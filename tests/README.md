@@ -34,7 +34,7 @@ services actually run under, and falls back to system `python3` otherwise — sa
 The suite needs no third-party packages: the services import PyYAML lazily, inside the functions
 that read a config file, and no test reaches those paths. `app/rules.py` has no DeepStream imports
 at all, deliberately — the code that decides whether a worker is compliant is the part most likely
-to be subtly wrong, and checking it should not require a Jetson and a video feed.
+to be subtly wrong, and checking it should not require a GPU and a video feed.
 
 ## Two tests worth knowing about
 
