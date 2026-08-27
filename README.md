@@ -324,14 +324,62 @@ Check with `curl http://localhost:9080/notify/status`.
 
 ## Running it
 
+`./scripts/docker_up.sh` always adds `compose.spark.yml` on this host. `--profile sources` is
+what actually starts cameras: MediaMTX on **:8654** restreams `media/` as `cam01…cam19`, and
+the `webcam` service publishes `/dev/video0` as `rtsp://127.0.0.1:8654/webcam`.
+
+### Start — cameras running
+
+One-time: `docker/.env` must say RTSP (Compose interpolates this file; a repo-root `.env` is
+ignored for `ISMS_*`). Slot 20 is the USB camera:
+
 ```bash
-./scripts/docker_up.sh                         # start (adds compose.spark.yml on this host)
-./scripts/docker_up.sh --profile sources up -d # + restreamers / webcam
-./scripts/docker_up.sh --profile sources down  # stop; volumes survive
+cp -n docker/.env.example docker/.env
+# Then set in docker/.env:
+#   ISMS_SOURCE=rtsp
+#   ISMS_STREAMS=20
+#   ISMS_RGB_CAPTURE=0
+#   ISMS_RTSP_URLS=$(./scripts/serve_webcam.sh urls 20)
 ```
 
-Pause/resume from the dashboard header stops the pipeline process (SIGKILL — TensorRT unloads)
-without unloading Cosmos or Nemotron.
+Bring the restreamers, webcam, app, VLM and LLM up:
+
+```bash
+./scripts/docker_up.sh --profile sources up -d --build
+./scripts/docker_up.sh up -d --force-recreate app
+```
+
+The recreate is required after changing `docker/.env` — `restart` keeps the old environment.
+Wait until `docker logs -f isms-webcam-1` shows `-> rtsp://127.0.0.1:8654/webcam`, then open
+**http://\<spark\>:9080/**. Tile **CAM 20** is the live camera; 01–19 are the demo files over RTSP.
+
+To start again later with `docker/.env` already set:
+
+```bash
+./scripts/docker_up.sh --profile sources up -d
+```
+
+Bare `./scripts/docker_up.sh` is file mode (no `:8654`, no webcam). After a reboot, if the wall
+is empty, the restreamers are down — use the `--profile sources` line, not a plain `up`.
+
+Pause/resume in the dashboard header only kills the pipeline process (TensorRT unloads). Cosmos
+and Nemotron stay loaded. That is not a full stop.
+
+### Stop everything
+
+```bash
+./scripts/docker_up.sh --profile sources down
+```
+
+That stops **app, redis, vlm, llm, restreamers and webcam**. Named volumes (engines, weights,
+incidents, clips) survive. Omit `--profile sources` and the camera containers can keep running
+while the app is gone.
+
+To wipe engines and model weights as well (next start rebuilds and re-pulls ~11 GB):
+
+```bash
+./scripts/docker_up.sh --profile sources down --volumes
+```
 
 | | |
 |---|---|
