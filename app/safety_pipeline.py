@@ -41,12 +41,16 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import yaml
 
@@ -541,6 +545,175 @@ def resolve_sources(cfg: dict, count: int, mode: str) -> list[str]:
     if len(files) < count:
         raise SystemExit(f"need {count} clips, found {len(files)} — run scripts/make_streams.sh {count}")
     return [f"file://{os.path.abspath(f)}" for f in files[:count]]
+
+
+def classify_source(uri: str, camera_id: int) -> dict:
+    """What the operator is looking at, from the URI the pipeline actually opened.
+
+    Types are inferred, not configured, so adding a camera later does not need a new enum:
+    file:// is a clip, a path named webcam (or a v4l2 device) is a USB camera, numbered
+    mounts on the local restreamer are demo files over RTSP, and anything else on rtsp://
+    is a live camera. Credentials are stripped before this leaves the process.
+    """
+    raw = (uri or "").strip()
+    if raw.startswith("file://"):
+        name = Path(raw[7:]).name
+        return {"camera_id": camera_id, "type": "file", "label": name, "uri": f"file://{name}"}
+    if raw.startswith("v4l2://") or raw.startswith("/dev/video"):
+        return {"camera_id": camera_id, "type": "webcam", "label": "USB webcam", "uri": raw}
+
+    p = urlparse(raw)
+    host = p.hostname or ""
+    netloc = f"{host}:{p.port}" if p.port else host
+    safe = urlunparse((p.scheme, netloc, p.path or "", "", "", ""))
+    last = (p.path or "").rstrip("/").rsplit("/", 1)[-1].lower()
+
+    local = host in ("127.0.0.1", "localhost") or host.startswith("127.")
+    if last.startswith("webcam"):
+        return {"camera_id": camera_id, "type": "webcam", "label": "USB webcam", "uri": safe}
+    if p.scheme == "rtsp" and re.match(r"cam\d+", last) and (p.port == 8654 or local):
+        return {"camera_id": camera_id, "type": "restream", "label": last, "uri": safe}
+    if p.scheme in ("rtsp", "rtsps", "http", "https"):
+        return {"camera_id": camera_id, "type": "rtsp",
+                "label": last or host or f"cam{camera_id:02d}", "uri": safe}
+    return {"camera_id": camera_id, "type": "unknown", "label": last or f"cam{camera_id:02d}",
+            "uri": safe}
+
+
+# USB webcams and live IP cameras. Demo clips (`file`) and numbered restream mounts (`camNN`)
+# keep the authored warehouse floor plan. Adding a camera later is a new URI in this set, not a
+# hardcoded slot — cam20 showing cam04's aisles is what this is here to stop.
+PHYSICAL_SOURCE_TYPES = frozenset({"webcam", "rtsp", "unknown"})
+_ANALYTICS_STREAM_SEC = re.compile(
+    r"^\[(roi-filtering|overcrowding|line-crossing)-stream-(\d+)\]\s*$")
+
+
+def is_physical_source(uri: str, camera_id: int = 0) -> bool:
+    return classify_source(uri, camera_id)["type"] in PHYSICAL_SOURCE_TYPES
+
+
+def runtime_analytics_config(src: Path, uris: list[str]) -> Path | None:
+    """nvdsanalytics config with floor-plan sections removed for physical cameras.
+
+    osd-mode is global, so the only way to hide aisle polygons on one pad is to omit that
+    pad's ROI/overcrowding/line sections. Those polygons are also the wrong geometry for a
+    live camera in a demo slot (zones.yml aliases cam20 to cam04), so analytics for that
+    stream is dropped too — occupancy would otherwise tag webcam incidents as AisleLeft.
+    Returns None when nothing remains to analyse.
+    """
+    skip = {i for i, u in enumerate(uris) if is_physical_source(u, i + 1)}
+    if not skip:
+        return src
+    dropping = False
+    kept_stream = False
+    out: list[str] = []
+    for line in src.read_text().splitlines():
+        m = _ANALYTICS_STREAM_SEC.match(line)
+        if m:
+            dropping = int(m.group(2)) in skip
+            if not dropping:
+                kept_stream = True
+        elif line.startswith("["):
+            dropping = False
+        if dropping:
+            continue
+        out.append(line)
+    skipped = ", ".join(
+        f"{i + 1} ({classify_source(uris[i], i + 1)['type']})"
+        for i in sorted(skip) if i < len(uris))
+    print(f"[zones] no floor-plan OSD on physical cameras: {skipped}", flush=True)
+    if not kept_stream:
+        return None
+    dest = ROOT / "data" / "analytics.runtime.txt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(out) + "\n")
+    return dest
+
+
+class TilerView:
+    """Runtime switch for nvmultistreamtiler `show-source`.
+
+    The live encode is one 1080p mosaic. Setting show-source to a pad index fills that encode
+    with that camera at muxer resolution (1080p here). -1 is the wall. Bound to loopback so
+    the dashboard can ask without exposing a control port on the LAN.
+    """
+
+    PORT = int(os.environ.get("ISMS_TILER_CTRL_PORT", "9079"))
+
+    def __init__(self, pipeline: Pipeline, uris: list[str], source_mode: str, streams: int):
+        self.pipeline = pipeline
+        self.uris = uris
+        self.source_mode = source_mode
+        self.streams = streams
+        self.show_source = -1
+        self._lock = threading.Lock()
+        self._httpd: ThreadingHTTPServer | None = None
+
+    def snapshot(self) -> dict:
+        return {
+            "show_source": self.show_source,
+            "camera": None if self.show_source < 0 else self.show_source + 1,
+            "streams": self.streams,
+            "source_mode": self.source_mode,
+            "cameras": [classify_source(u, i + 1) for i, u in enumerate(self.uris)],
+        }
+
+    def set_camera(self, camera: int) -> dict:
+        if camera is None or camera <= 0:
+            idx = -1
+        else:
+            if camera > self.streams:
+                raise ValueError(f"camera {camera} is not in this graph (1..{self.streams})")
+            idx = camera - 1
+        with self._lock:
+            self.pipeline["tiler"].set({"show-source": int(idx)})
+            self.show_source = idx
+        return self.snapshot()
+
+    def start(self) -> None:
+        view = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: A003
+                return
+
+            def _send(self, code: int, body: dict) -> None:
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                if urlparse(self.path).path != "/view":
+                    self._send(404, {"error": "not found"})
+                    return
+                self._send(200, view.snapshot())
+
+            def do_POST(self):  # noqa: N802
+                if urlparse(self.path).path != "/view":
+                    self._send(404, {"error": "not found"})
+                    return
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    cam = int((q.get("camera") or ["-1"])[0])
+                    self._send(200, view.set_camera(cam))
+                except ValueError as e:
+                    self._send(400, {"error": str(e)})
+                except Exception as e:  # noqa: BLE001
+                    self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+        class ReuseHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        self._httpd = ReuseHTTPServer(("127.0.0.1", self.PORT), Handler)
+        threading.Thread(target=self._httpd.serve_forever, name="tiler-view", daemon=True).start()
+        print(f"[tiler] show-source control at http://127.0.0.1:{self.PORT}/view", flush=True)
+
+    def stop(self) -> None:
+        if self._httpd:
+            self._httpd.shutdown()
 
 
 def _detect_display() -> str | None:
@@ -1177,7 +1350,7 @@ def _q(p: Pipeline, name: str, size: int = 4):
     return name
 
 
-def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
+def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay, list[str]]:
     count = args.streams
     mode = args.source
     live = mode == "rtsp"
@@ -1310,14 +1483,18 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
     # The config is GENERATED from configs/analytics/zones.yml by scripts/make_zones.py — its
     # section suffixes are source indices, so it is regenerated whenever the stream count or the
     # zone geometry changes.
-    an_cfg = ROOT / "configs/analytics/analytics.txt"
-    if args.zones and an_cfg.exists():
-        p.add("nvdsanalytics", "analytics", {"config-file": str(an_cfg)})
-        p.link(head, _q(p, "q_pre_analytics"), "analytics")
-        head = "analytics"
-        print(f"[zones] nvdsanalytics enabled ({an_cfg.name})", flush=True)
+    an_src = ROOT / "configs/analytics/analytics.txt"
+    if args.zones and an_src.exists():
+        an_cfg = runtime_analytics_config(an_src, uris)
+        if an_cfg is not None:
+            p.add("nvdsanalytics", "analytics", {"config-file": str(an_cfg)})
+            p.link(head, _q(p, "q_pre_analytics"), "analytics")
+            head = "analytics"
+            print(f"[zones] nvdsanalytics enabled ({an_cfg.name})", flush=True)
+        else:
+            print("[zones] skipped — every source is a physical camera", flush=True)
     elif args.zones:
-        print(f"[zones] {an_cfg} missing — run scripts/make_zones.py --generate", flush=True)
+        print(f"[zones] {an_src} missing — run scripts/make_zones.py --generate", flush=True)
 
     probe_point = head  # last element that still carries one frame_meta PER STREAM
 
@@ -1381,7 +1558,7 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
         overlay.track_stats = args.track_stats
         overlay.streams = count
         p.attach(probe_point, Probe("safety-overlay", overlay))
-        return p, overlay
+        return p, overlay, uris
 
     # compute-hw: 0=Default (VIC on Jetson), 1=GPU, 2=VIC.
     #
@@ -1396,6 +1573,7 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
         "rows": rows, "columns": cols,
         "width": tiler["width"], "height": tiler["height"],
         "compute-hw": compute_hw,
+        "show-source": -1,
     })
 
     # This install ships `nvdsosd`, not the `nvosdbin` wrapper. nvdsosd's GPU mode accepts NV12
@@ -1471,6 +1649,9 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
     overlay.streams = count
     if args.zones:
         overlay.zone_severity = load_zone_severity(count)
+        for i, u in enumerate(uris):
+            if is_physical_source(u, i + 1):
+                overlay.zone_severity.pop(i + 1, None)
         overlay.dump_analytics = args.dump_analytics
         overlay.dump_analytics_frame = args.dump_analytics
 
@@ -1488,7 +1669,7 @@ def build(cfg: dict, args) -> tuple[Pipeline, SafetyOverlay]:
     if not args.no_attach:
         print(f"[probe] attached to '{probe_point}' (pre-tiler, per-stream metadata)", flush=True)
         p.attach(probe_point, Probe("safety-overlay", overlay))
-    return p, overlay
+    return p, overlay, uris
 
 
 def _add_rtsp_branch(p: Pipeline, cfg: dict, src: str, common: dict) -> None:
@@ -1610,7 +1791,7 @@ def main() -> int:
           f"tiles {rows}x{cols} | dfi={_dfi} ({_rate}) | "
           f"DISPLAY={os.environ.get('DISPLAY', '-')}", flush=True)
 
-    pipeline, overlay = build(cfg, args)
+    pipeline, overlay, uris = build(cfg, args)
 
     # Events are wired AFTER build() and before start(): the emitter opens a socket and starts a
     # thread, and neither belongs in graph construction.
@@ -1673,6 +1854,14 @@ def main() -> int:
 
     pipeline.start()
 
+    tiler_view = None
+    if not args.no_osd:
+        try:
+            tiler_view = TilerView(pipeline, uris, args.source, args.streams)
+            tiler_view.start()
+        except Exception as e:  # noqa: BLE001
+            print(f"[tiler] view control not started: {type(e).__name__}: {e}", flush=True)
+
     # pipeline.wait() blocks inside C++, so Python signal handlers never run — SIGINT and
     # SIGTERM are both ignored until the pipeline ends on its own. A timer thread calling
     # pipeline.stop() is the only reliable way to bound a run, which is what the sweep needs.
@@ -1685,6 +1874,8 @@ def main() -> int:
         timer.start()
 
     pipeline.wait()
+    if tiler_view is not None:
+        tiler_view.stop()
     # Only reachable on a clean stop (EOS). `timeout --signal=KILL` bypasses this, which is why
     # both of these also report periodically from inside the probe.
     overlay.report_track_stability()

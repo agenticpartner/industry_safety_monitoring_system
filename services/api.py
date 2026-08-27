@@ -36,6 +36,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -122,6 +123,16 @@ def _arg_value(args: list[str], flag: str) -> str | None:
 
 
 LAST_PIPELINE_PATH = ROOT / "data" / "pipeline_last.json"
+TILER_CTRL = os.environ.get("ISMS_TILER_CTRL", "http://127.0.0.1:9079").rstrip("/")
+
+
+def _tiler_view() -> dict | None:
+    """Current show-source + per-camera type. None if the pipeline control port is down."""
+    try:
+        with urllib.request.urlopen(f"{TILER_CTRL}/view", timeout=0.4) as fh:
+            return json.loads(fh.read().decode())
+    except Exception:
+        return None
 
 
 def _load_last_pipeline() -> dict | None:
@@ -233,8 +244,17 @@ def pipeline_status():
     dfi = int(dfi_arg) if dfi_arg is not None else cfg_dfi
     fps = (30 // dfi) if dfi > 1 else 30
 
+    tcfg = (DEMO.get("pipeline") or {}).get("tiler") or {}
+    t_rows, t_cols = tcfg.get("rows"), tcfg.get("cols")
+    if t_rows and t_cols:
+        tile_rows, tile_cols = int(t_rows), int(t_cols)
+    else:
+        tile_cols = int(streams ** 0.5 + 0.999)
+        tile_rows = (streams + tile_cols - 1) // tile_cols
+
     rgb_capture = ("--rgb-capture" in args) if pids else None
     last = _load_last_pipeline()
+    view = _tiler_view() if pids else None
     return {
         "running": bool(pids), "pids": pids,
         "streams": streams,
@@ -242,6 +262,8 @@ def pipeline_status():
         "drop_frame_interval": dfi,
         "analytics_fps_per_stream": fps,
         "realtime_target_fps": streams * fps,
+        "tile_rows": tile_rows,
+        "tile_cols": tile_cols,
         "zones": ("--zones" in args) if pids else (
             ROOT / "configs/analytics/analytics.txt").exists(),
         "events": ("--events" in args) if pids else None,
@@ -250,6 +272,10 @@ def pipeline_status():
         "last_run": last,
         "configured": {"streams": cfg_streams, "drop_frame_interval": cfg_dfi},
         "config_differs": bool(pids) and (streams != cfg_streams or dfi != cfg_dfi),
+        "show_source": (view or {}).get("show_source") if pids else None,
+        "camera_view": (view or {}).get("camera") if pids else None,
+        "cameras": (view or {}).get("cameras") or [],
+        "view_control": bool(view),
     }
 
 
@@ -326,6 +352,42 @@ def pipeline_stop():
         except ProcessLookupError:
             pass
     return {"stopped": pids, "last_run": snap}
+
+
+@app.get("/pipeline/view", tags=["pipeline"])
+def pipeline_view_get():
+    """Which camera fills the live encode, plus a typed inventory of the running sources."""
+    if not _proc_running("safety_pipeline.py"):
+        raise HTTPException(503, "pipeline is not running")
+    view = _tiler_view()
+    if view is None:
+        raise HTTPException(503, "pipeline view control is not up yet")
+    return view
+
+
+@app.post("/pipeline/view", tags=["pipeline"])
+def pipeline_view_set(camera: int = Query(..., ge=-1, le=64)):
+    """Fill the 1080p live encode with one camera (`show-source`) or restore the wall (`-1`).
+
+    Camera ids are 1-based and match the dashboard. The upper bound is the running graph,
+    not a hardcoded 20 — adding a camera later is a restart with more URIs, then this
+    accepts the new id. Types come from the URI the pipeline opened, not a config enum.
+    """
+    if not _proc_running("safety_pipeline.py"):
+        raise HTTPException(503, "pipeline is not running")
+    req = urllib.request.Request(f"{TILER_CTRL}/view?camera={int(camera)}", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as fh:
+            return json.loads(fh.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:400]
+        try:
+            detail = json.loads(body).get("error") or body
+        except json.JSONDecodeError:
+            detail = body or e.reason
+        raise HTTPException(e.code if e.code >= 400 else 502, str(detail)) from e
+    except Exception as e:
+        raise HTTPException(503, f"pipeline view control: {e}") from e
 
 
 @app.patch("/pipeline/config", tags=["pipeline"])

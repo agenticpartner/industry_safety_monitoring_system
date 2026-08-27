@@ -220,10 +220,31 @@
 
   /* live view */
   .live { position:relative; background:#000; border-radius:10px; overflow:hidden; aspect-ratio:16/9; }
-  .live video { width:100%; height:100%; object-fit:contain; display:block; }
+  .live video { display:block; background:#000; }
+  #live-stage {
+    position:absolute; inset:0; overflow:hidden;
+  }
+  #live-stage video {
+    position:absolute; top:0; left:0; width:100%; height:100%;
+    object-fit:fill;
+  }
+  #live-grid {
+    position:absolute; inset:0; z-index:3;
+    display:grid; pointer-events:none;
+  }
+  #live-grid span {
+    pointer-events:auto; cursor:zoom-in;
+    border:1px solid transparent;
+  }
+  #live-grid span:hover {
+    background:rgba(242,183,5,.16);
+    box-shadow:inset 0 0 0 2px var(--accent);
+  }
+  #live-wrap.zoomed #live-grid { display:none; }
+  #live-wrap.zoomed { cursor:zoom-out; }
   .live .ph {
     position:absolute; inset:0; display:grid; place-items:center; text-align:center;
-    color:var(--text-3); font-size:13px; padding:16px; gap:8px;
+    color:var(--text-3); font-size:13px; padding:16px; gap:8px; z-index:5;
   }
   .live-badge {
     position:absolute; top:9px; left:9px; z-index:2; display:flex; align-items:center; gap:6px;
@@ -245,8 +266,8 @@
      see a violation box. The aspect-ratio that keeps the card tidy has to be dropped here, or
      the video letterboxes inside a 16/9 box inside a taller screen. */
   .live:fullscreen { aspect-ratio:auto; width:100vw; height:100vh; border-radius:0; }
-  .live:fullscreen video { object-fit:contain; }
-  #btn-fs { cursor:pointer; }
+  .live:fullscreen #live-stage video { object-fit:fill; }
+  #btn-fs, #btn-unzoom { cursor:pointer; }
 
   /* Bounded to the viewport and sticky, NOT stretched to the left column's height. Letting it
      fill made a single card run past the calendar, the zone chart and the agent — one panel as
@@ -405,7 +426,7 @@
 </head>
 <body>
 <header>
-  <h1>Industry Safety <em>Operations</em> Monitoring System <span>· AGX Orin</span></h1>
+  <h1>Industry Safety <em>Operations</em> Monitoring System <span id="hdr-device">· DGX Spark</span></h1>
   <span class="pill"><span class="dot" id="d-pipe"></span>pipeline</span>
   <span class="pill"><span class="dot" id="d-vlm"></span>VLM</span>
   <span class="pill"><span class="dot" id="d-llm"></span>agent</span>
@@ -434,12 +455,20 @@
     <div class="grid stack">
       <div class="card" id="live-card" hidden>
         <h2>Live tiled output <span class="muted" id="live-mode"></span>
-          <button id="btn-fs" style="margin-left:auto;font-size:11px;padding:3px 8px"
-                  title="Fullscreen (or double-click the video)">⛶ fullscreen</button>
+          <span class="muted" style="font-weight:500">· click a tile for 1080p</span>
+          <span style="margin-left:auto;display:flex;gap:6px">
+            <button id="btn-unzoom" hidden style="font-size:11px;padding:3px 8px"
+                    title="Back to the camera wall">CAM · wall</button>
+            <button id="btn-fs" style="font-size:11px;padding:3px 8px"
+                    title="Fullscreen (or double-click the video)">⛶ fullscreen</button>
+          </span>
         </h2>
         <div class="live" id="live-wrap">
           <div class="live-badge"><span class="dot"></span>LIVE</div>
-          <video id="live-video" autoplay muted playsinline></video>
+          <div id="live-stage">
+            <video id="live-video" autoplay muted playsinline></video>
+          </div>
+          <div id="live-grid" aria-hidden="true"></div>
           <div class="ph" id="live-ph">
             <div id="live-reason">Checking the live path…</div>
             <div class="muted" id="live-action" style="font-size:12px"></div>
@@ -913,7 +942,12 @@ async function connectWhep(){
     pc = new RTCPeerConnection({ iceServers: [] });
     pc.addTransceiver("video", { direction: "recvonly" });
     pc.addTransceiver("audio", { direction: "recvonly" });
-    pc.ontrack = ev => { $("#live-video").srcObject = ev.streams[0]; $("#live-ph").style.display = "none"; };
+    pc.ontrack = ev => {
+      $("#live-video").srcObject = ev.streams[0];
+      $("#live-ph").style.display = "none";
+      layoutLiveStage();
+      buildLiveGrid();
+    };
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     const r = await fetch(`http://${host}:${WHEP_PORT}/${PATHNAME}/whep`, {
@@ -927,7 +961,11 @@ async function connectWhep(){
     $("#live-mode").textContent = "· HLS fallback";
     const v = $("#live-video");
     v.src = `http://${host}:${HLS_PORT}/${PATHNAME}/index.m3u8`;
-    v.play().then(() => $("#live-ph").style.display = "none")
+    v.play().then(() => {
+      $("#live-ph").style.display = "none";
+      layoutLiveStage();
+      buildLiveGrid();
+    })
             .catch(() => { $("#live-mode").textContent = "· unavailable"; $("#live-ph").style.display = "grid"; });
   }
 }
@@ -1026,6 +1064,13 @@ async function waitForPipe(wantRunning, ms = 20000) {
 }
 
 function dropLiveView() {
+  TILE.cam = null;
+  TILE.want = null;
+  const wrap = $("#live-wrap");
+  if (wrap) wrap.classList.remove("zoomed");
+  const btn = $("#btn-unzoom");
+  if (btn) btn.hidden = true;
+  resetLiveCss();
   if (pc) { try { pc.close(); } catch {} pc = null; }
   const v = $("#live-video");
   v.srcObject = null;
@@ -1046,6 +1091,7 @@ $("#btn-pipe").onclick = async () => {
   btn.textContent = pause ? "pausing…" : "resuming…";
   try {
     if (pause) {
+      try { await fetch("/pipeline/view?camera=-1", { method: "POST" }); } catch {}
       dropLiveView();
       await fetch("/pipeline/stop", { method: "POST" });
       await waitForPipe(false, 8000);
@@ -1071,6 +1117,141 @@ $("#btn-pipe").onclick = async () => {
   refreshHealth();
 };
 
+/* Click a tile → tiler show-source. The same 1080p WebRTC encode then carries that camera
+   at muxer resolution instead of a CSS crop of the mosaic. The grid is built from the
+   running stream count; source type is inferred from each URI (file / restream / webcam / rtsp). */
+const TILE = { rows: 4, cols: 5, streams: 20, cam: null, cameras: [], clickTimer: null, busy: false, want: null, _camKey: "" };
+
+function tileLayout(n) {
+  const cols = Math.ceil(Math.sqrt(n));
+  return { cols, rows: Math.ceil(n / cols) };
+}
+
+function resetLiveCss() {
+  const v = $("#live-video");
+  if (!v) return;
+  v.style.width = "100%";
+  v.style.height = "100%";
+  v.style.left = "0";
+  v.style.top = "0";
+}
+
+function cameraInfo(id) {
+  return (TILE.cameras || []).find(c => c.camera_id === id) || {};
+}
+
+function layoutLiveStage() {
+  const wrap = $("#live-wrap"), stage = $("#live-stage"), grid = $("#live-grid"), v = $("#live-video");
+  if (!wrap || !stage) return;
+  const wr = wrap.getBoundingClientRect();
+  const vw = v.videoWidth || 1920, vh = v.videoHeight || 1080;
+  let left = 0, top = 0, w = wr.width, h = wr.height;
+  if (document.fullscreenElement === wrap && vw && vh) {
+    const scale = Math.min(wr.width / vw, wr.height / vh);
+    w = vw * scale; h = vh * scale;
+    left = (wr.width - w) / 2; top = (wr.height - h) / 2;
+  }
+  for (const el of [stage, grid]) {
+    el.style.left = left + "px";
+    el.style.top = top + "px";
+    el.style.width = w + "px";
+    el.style.height = h + "px";
+  }
+}
+
+function buildLiveGrid() {
+  const grid = $("#live-grid");
+  if (!grid) return;
+  const n = TILE.streams;
+  grid.style.gridTemplateColumns = `repeat(${TILE.cols}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${TILE.rows}, 1fr)`;
+  grid.innerHTML = "";
+  for (let i = 0; i < TILE.rows * TILE.cols; i++) {
+    const cell = document.createElement("span");
+    if (i < n) {
+      const info = cameraInfo(i + 1);
+      const kind = info.type || "";
+      cell.title = `CAM ${String(i + 1).padStart(2, "0")}` +
+        (kind ? ` · ${kind}` : "") + (info.uri ? ` · ${info.uri}` : "");
+      cell.dataset.i = String(i);
+    } else {
+      cell.style.pointerEvents = "none";
+    }
+    grid.appendChild(cell);
+  }
+}
+
+function paintLiveView(d) {
+  if (!d) return;
+  if (d.cameras) TILE.cameras = d.cameras;
+  if (d.streams) TILE.streams = d.streams;
+  const cam = d.camera || null;
+  TILE.cam = cam;
+  resetLiveCss();
+  const wrap = $("#live-wrap"), btn = $("#btn-unzoom");
+  if (!wrap || !btn) return;
+  if (cam) {
+    wrap.classList.add("zoomed");
+    const info = cameraInfo(cam);
+    const kind = info.type || "camera";
+    btn.hidden = false;
+    btn.textContent = `CAM ${String(cam).padStart(2, "0")} · ${kind} · wall`;
+    btn.title = (info.uri ? info.uri + " · " : "") + "back to the wall";
+  } else {
+    wrap.classList.remove("zoomed");
+    btn.hidden = true;
+  }
+}
+
+async function setLiveCamera(camera) {
+  TILE.want = camera;
+  if (TILE.busy) return;
+  TILE.busy = true;
+  const btn = $("#btn-unzoom");
+  try {
+    while (TILE.want !== null) {
+      const cam = TILE.want;
+      TILE.want = null;
+      const r = await fetch("/pipeline/view?camera=" + encodeURIComponent(cam), { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const msg = d.error || d.detail || ("view " + r.status);
+        if (btn) { btn.hidden = false; btn.textContent = "view failed · wall"; btn.title = String(msg); }
+        throw new Error(msg);
+      }
+      paintLiveView(d);
+      buildLiveGrid();
+    }
+  } catch (e) {
+    console.warn("live view", e);
+  } finally {
+    TILE.busy = false;
+  }
+}
+
+function zoomLive(i) {
+  if (i == null || i < 0 || i >= TILE.streams) return;
+  setLiveCamera(i + 1);
+}
+
+function unzoomLive() {
+  setLiveCamera(-1);
+}
+
+$("#live-grid").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const cell = e.target.closest("span");
+  if (!cell || cell.dataset.i == null) return;
+  clearTimeout(TILE.clickTimer);
+  TILE.clickTimer = setTimeout(() => zoomLive(parseInt(cell.dataset.i, 10)), 220);
+});
+$("#live-wrap").addEventListener("click", (e) => {
+  if (!TILE.cam) return;
+  if (e.target.closest("#btn-fs") || e.target.closest("#btn-unzoom") || e.target.closest("#btn-rtsp-start")) return;
+  unzoomLive();
+});
+$("#btn-unzoom").onclick = (e) => { e.stopPropagation(); unzoomLive(); };
+
 /* Fullscreen the wall. Twenty tiles inside a dashboard card are ~180px wide each, which is not
    enough to see a bounding box, let alone read the OSD. Fullscreen is what makes the live view
    usable as a monitoring wall rather than a thumbnail. */
@@ -1081,10 +1262,15 @@ function toggleFullscreen(){
   else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();  // Safari
 }
 $("#btn-fs").onclick = e => { e.stopPropagation(); toggleFullscreen(); };
-$("#live-wrap").addEventListener("dblclick", toggleFullscreen);
+$("#live-wrap").addEventListener("dblclick", (e) => {
+  clearTimeout(TILE.clickTimer);
+  toggleFullscreen();
+});
 document.addEventListener("fullscreenchange", () => {
   $("#btn-fs").textContent = document.fullscreenElement ? "⛶ exit fullscreen" : "⛶ fullscreen";
+  layoutLiveStage();
 });
+window.addEventListener("resize", layoutLiveStage);
 
 $("#btn-rtsp-start").onclick = async () => {
   const btn = $("#btn-rtsp-start"), was = btn.textContent;
@@ -1113,6 +1299,24 @@ async function refreshHealth(){
     const st = await get("/pipeline/status");
     rememberPipe(st);
     paintPipeButton();
+    const n = st.running ? st.streams : ((PIPE.last && PIPE.last.streams) || st.configured.streams);
+    const lay = (st.tile_rows && st.tile_cols)
+      ? { rows: st.tile_rows, cols: st.tile_cols }
+      : tileLayout(n);
+    if (st.cameras && st.cameras.length) TILE.cameras = st.cameras;
+    const camKey = (st.cameras || []).map(c => `${c.camera_id}:${c.type}`).join(",");
+    if (TILE.streams !== n || TILE.rows !== lay.rows || TILE.cols !== lay.cols) {
+      TILE.streams = n; TILE.rows = lay.rows; TILE.cols = lay.cols;
+      TILE._camKey = camKey;
+      if (TILE.cam) unzoomLive();
+      buildLiveGrid();
+    } else if (camKey && camKey !== TILE._camKey) {
+      TILE._camKey = camKey;
+      buildLiveGrid();
+    }
+    if (st.running && st.view_control) {
+      paintLiveView({ camera: st.camera_view, cameras: st.cameras, streams: st.streams });
+    }
     const diff = st.config_differs ? ` (cfg ${st.configured.streams})` : "";
     const lastN = (PIPE.last && PIPE.last.streams) || st.configured.streams;
     $("#p-fps").textContent = st.running
@@ -1146,10 +1350,13 @@ async function refreshSystem(){
   // Which machine this is. The same UI now serves a Jetson and an x86 box and the numbers alone
   // do not say which, so the platform is named rather than inferred from a missing series.
   const plat = $("#sys-platform");
+  const short = ({jetson:"Jetson", sbsa:"DGX Spark", dgpu:"x86"}[m.platform] || m.platform);
   if(m.device){
-    plat.textContent = ({jetson:"Jetson", sbsa:"DGX Spark", dgpu:"x86"}[m.platform] || m.platform) + " · " + m.device;
+    plat.textContent = short + " · " + m.device;
     plat.hidden = false;
   }
+  const hdr = $("#hdr-device");
+  if(hdr) hdr.textContent = "· " + (short === "x86" && m.device ? m.device : short);
   // `ram` is the memory the GPU draws from: the unified pool on Jetson, VRAM on a discrete card.
   // Same question, different name, so the legend follows the platform rather than picking one.
   const ramSeries = SERIES.find(x => x.key === "ram");

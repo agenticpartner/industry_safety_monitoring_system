@@ -98,19 +98,29 @@ def device_label() -> tuple[str, str]:
             pass
         return "jetson", "NVIDIA Jetson"
 
+    product = ""
+    try:
+        with open("/sys/class/dmi/id/product_name") as fh:
+            product = fh.read().strip().replace("_", " ")
+    except OSError:
+        pass
+
+    gpu = ""
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=10)
         name = (out.stdout or "").strip().splitlines()
         if name and name[0].strip():
             gpu = name[0].strip()
-            machine = os.uname().machine if hasattr(os, "uname") else ""
-            if machine == "aarch64":
-                return "sbsa", gpu
-            return "dgpu", gpu
     except (OSError, subprocess.SubprocessError):
         pass
-    return "dgpu", "discrete NVIDIA GPU"
+
+    machine = os.uname().machine if hasattr(os, "uname") else ""
+    if machine == "aarch64":
+        # Chassis name beats GPU name on Spark: nvidia-smi reports GB10, DMI reports DGX Spark.
+        label = product or gpu or "NVIDIA SBSA"
+        return "sbsa", label
+    return "dgpu", gpu or product or "discrete NVIDIA GPU"
 
 
 def parse(line: str) -> dict | None:
