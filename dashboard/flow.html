@@ -53,7 +53,7 @@
     border:1px solid var(--border-2); border-radius:9px; padding:6px 12px; background:var(--surface-2);
   }
   .back:hover { border-color:var(--accent); color:var(--text-1); }
-  main { max-width:1180px; margin:0 auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+  main { width:100%; max-width:none; margin:0; padding:20px 24px; display:flex; flex-direction:column; gap:16px; }
   .card {
     background:var(--surface-1); border:1px solid var(--border); border-radius:13px; padding:16px 18px;
   }
@@ -74,14 +74,12 @@
     padding:9px 13px; font-size:12.5px; color:var(--text-2); margin:12px 0 0;
   }
   .note b { color:var(--accent-2); }
-  .wrap { overflow-x:auto; }
-  svg { display:block; max-width:100%; }
+  .wrap { overflow-x:auto; width:100%; }
+  .wrap svg { display:block; width:100%; height:auto; max-width:none; }
   .legend { display:flex; flex-wrap:wrap; gap:10px 16px; font-size:12px; color:var(--text-2); margin-top:12px; }
   .legend i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
-  .cols { display:grid; grid-template-columns:1fr minmax(260px, 320px); gap:16px; }
-  @media (max-width:900px){ .cols { grid-template-columns:1fr; } }
   #log {
-    list-style:none; margin:0; padding:0; max-height:360px; overflow:auto;
+    list-style:none; margin:0; padding:0; max-height:280px; overflow:auto;
     font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color:var(--text-2);
   }
@@ -126,11 +124,10 @@
     </div>
   </section>
 
-  <div class="cols">
-    <section class="card">
-      <h2>Architecture</h2>
-      <div class="wrap">
-        <svg viewBox="0 0 1120 360" width="1120" height="360" role="img"
+  <section class="card">
+    <h2>Architecture</h2>
+    <div class="wrap">
+        <svg viewBox="0 0 1120 360" width="100%" height="auto" preserveAspectRatio="xMidYMid meet" role="img"
              aria-label="live pipeline with work moving along the edges">
           <defs>
             <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -225,13 +222,12 @@
         second and would lie about what the operator can act on. The gold path is a heartbeat.
         Incidents, clips and verdicts are 1:1 with store rows.
       </div>
-    </section>
+  </section>
 
-    <section class="card">
-      <h2>Work log</h2>
-      <ul id="log" aria-live="polite"></ul>
-    </section>
-  </div>
+  <section class="card">
+    <h2>Work log</h2>
+    <ul id="log" aria-live="polite"></ul>
+  </section>
 </main>
 
 <footer>Industry Safety Operations Monitoring System · live work, not decoration</footer>
