@@ -392,6 +392,30 @@ To wipe engines and model weights as well (next start rebuilds and re-pulls ~11 
 | Live view (WebRTC) | `http://<spark>:8889/safety` |
 | Logs | `docker compose … logs -f app` and `logs/` in the app volume |
 
+### Seeing dashboard changes
+
+Ctrl+R talks to the **container**, not this checkout. `dashboard/` is copied into the image at
+build time, so a save on the host is invisible, and the browser then caches `/` so a normal
+reload keeps the old page even after the file inside the container has changed.
+
+After every HTML edit:
+
+```bash
+./scripts/reload_ui.sh
+```
+
+Then **Ctrl+Shift+R** (hard refresh) on `http://<spark>:9080/`. Plain Ctrl+R is not enough.
+
+One-time, so you can skip the copy on later HTML edits — recreate `app` so compose bind-mounts
+`dashboard/` from the host (pipeline restarts):
+
+```bash
+./scripts/docker_up.sh up -d --force-recreate app
+```
+
+After that, save + Ctrl+Shift+R is enough. Python (`services/`, `app/`) is still baked in the
+image: recreate `app` (add `--build` if you want the image itself updated).
+
 ### Timing to expect
 
 An alert appears in **under a second**. Its evidence clip follows after the smart-record window
@@ -488,6 +512,7 @@ The PPE model has **no `no-vest` class**, so a vest violation is inferred. The U
 | Agent always the same plan, slow | Soft fallback | Check `plan_error` in the response |
 | `database is locked` | Write on a read path | `project_skill.md` §6, traps 23 and 27 |
 | Empty wall after `down` | Restreamers on `:8654` were stopped | `./scripts/docker_up.sh --profile sources up -d` then recreate `app` |
+| Ctrl+R does not show UI edits | Browser cache + dashboard not mounted from the host | `./scripts/reload_ui.sh`, then **Ctrl+Shift+R** |
 
 The full trap list is in [`project_skill.md`](project_skill.md) §6.
 
@@ -500,7 +525,7 @@ app/            DeepStream pipeline and the rules that turn detections into even
 services/       store, clips, VLM, agent, API, alerts
 tools/          database integrity, verdict inspection
 tests/          unit tests, none of which need a GPU
-scripts/        docker_up, media, webcam, measurement
+scripts/        docker_up, reload_ui, media, webcam, measurement
 configs/        pipeline, model, tracker, zone and service configuration
 dashboard/      operator UI
 models/         labels and the custom TensorRT output parser

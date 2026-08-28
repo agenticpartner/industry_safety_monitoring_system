@@ -80,6 +80,10 @@ services:
       ISMS_API_PORT: "${ISMS_API_PORT:-8080}"
 
     volumes:
+      # Operator HTML. The image bakes a copy in at build time; without this mount, edits
+      # on the host are invisible until `docker cp` or an image rebuild. Recreate `app`
+      # once for the mount to attach. API reads these files per request — no API restart.
+      - ../dashboard:/opt/isms/dashboard:ro
       # Footage. Read-only: the pipeline decodes it and clip_service cuts from it with
       # `ffmpeg -c copy`, and neither has any reason to write back.
       - ../media:/opt/isms/media:ro

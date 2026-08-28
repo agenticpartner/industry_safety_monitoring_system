@@ -46,6 +46,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent.parent
+# Browsers cache `/` aggressively; Ctrl+R then keeps showing yesterday's dashboard even
+# after the file on disk has changed. The API reads HTML per request, so no-store is enough.
+_HTML_NO_STORE = {"Cache-Control": "no-store, max-age=0"}
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agent import LLM, TOOLS, ask, vocabulary  # noqa: E402
 from metrics import Sampler  # noqa: E402
@@ -1116,13 +1119,17 @@ def metrics_flow():
     }
 
 
+def _dashboard_html(name: str) -> HTMLResponse:
+    page = ROOT / "dashboard" / name
+    if not page.exists():
+        raise HTTPException(404, f"{name} not found")
+    return HTMLResponse(page.read_text(), headers=_HTML_NO_STORE)
+
+
 @app.get("/flow", response_class=HTMLResponse, include_in_schema=False)
 def flow_page():
     """Live particle view of work moving through the pipeline. Not the /system reference."""
-    page = ROOT / "dashboard/flow.html"
-    if not page.exists():
-        raise HTTPException(404, "flow page not found")
-    return HTMLResponse(page.read_text())
+    return _dashboard_html("flow.html")
 
 
 @app.get("/system", response_class=HTMLResponse, include_in_schema=False)
@@ -1133,22 +1140,20 @@ def system_page():
     monitor — mixing live values into it would leave a reader unsure which numbers are history
     and which are now, and every figure on it is a measurement with a script behind it.
     """
-    page = ROOT / "dashboard/system.html"
-    if not page.exists():
-        raise HTTPException(404, "system page not found")
-    return HTMLResponse(page.read_text())
+    return _dashboard_html("system.html")
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index():
     dash = ROOT / "dashboard/index.html"
     if dash.exists():
-        return HTMLResponse(dash.read_text())
+        return _dashboard_html("index.html")
     return HTMLResponse(
         "<h2>Industrial Safety Monitoring API</h2>"
         "<p>Dashboard lands in Phase 2.7. Meanwhile: "
         "<a href='/docs'>/docs</a> for the API browser, "
-        "<a href='/health'>/health</a> for status.</p>")
+        "<a href='/health'>/health</a> for status.</p>",
+        headers=_HTML_NO_STORE)
 
 
 def main() -> int:

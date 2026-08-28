@@ -100,6 +100,10 @@
     border:1px solid var(--border-2); background:var(--surface-2); color:var(--text-1);
     cursor:pointer; transition: background .15s ease, border-color .15s ease, transform .08s ease;
   }
+  /* Stay gone until /pipeline/status answers. The header is `display:flex`; without
+     !important the `hidden` attribute loses to that and the first paint is ⏸ Pause
+     even when inference is still down. */
+  #btn-pipe:not(.pipe-ready) { display: none !important; }
   button:hover { background:var(--surface-3); border-color:var(--text-3); }
   button:active { transform: translateY(1px); }
   button:disabled { opacity:.55; cursor:wait; transform:none; }
@@ -406,6 +410,9 @@
   .composer input:focus { outline:2px solid color-mix(in srgb, var(--s1) 60%, transparent); outline-offset:1px; }
   dialog { border:1px solid var(--border-2); border-radius:14px; background:var(--surface-1); color:var(--text-1);
            max-width:min(880px,94vw); padding:0; }
+  /* Author rules on `dialog` can drop the UA `display:none` for a closed dialog, which
+     parked "Pause the pipeline?" on the page before anyone clicked. */
+  dialog:not([open]) { display: none !important; }
   dialog::backdrop { background:rgba(0,0,0,.65); backdrop-filter:blur(2px); }
   .dlg-body { padding:16px 18px 18px; }
   #pipe-dlg { max-width:min(460px,94vw); }
@@ -433,7 +440,7 @@
   <span class="pill" id="p-fps">—</span>
   <span class="spacer"></span>
   <button id="btn-sound" title="Alarm sound needs one click before a browser will allow audio">🔇 sound off</button>
-  <button id="btn-pipe" title="Stop inference and free the GPU">⏸ Pause</button>
+  <button id="btn-pipe" type="button" hidden></button>
   <button id="btn-live">Live view</button>
   <!-- Opens in a new tab on purpose: it is a reference to read alongside the running dashboard,
        and navigating away would drop the WebRTC session and the alarm's primed state. -->
@@ -564,11 +571,11 @@
 
 <dialog id="pipe-dlg" aria-labelledby="pipe-dlg-title">
   <div class="dlg-body">
-    <h2 id="pipe-dlg-title">Pause the pipeline?</h2>
+    <h2 id="pipe-dlg-title"></h2>
     <p id="pipe-dlg-body"></p>
     <div class="actions">
       <button id="pipe-dlg-cancel" type="button">Cancel</button>
-      <button id="pipe-dlg-ok" type="button" class="danger">Pause</button>
+      <button id="pipe-dlg-ok" type="button"></button>
     </div>
   </div>
 </dialog>
@@ -985,9 +992,10 @@ $("#btn-live").onclick = () => {
    This is a real stop, not a freeze-frame: TensorRT engines unload with the process, which is
    what frees the GPU. Cosmos and the agent stay loaded because bringing them back takes minutes.
    Resume restages the same cameras / live output that were running, not the 1-file demo.yml. */
-let PIPE = { running: false, last: null };
+let PIPE = { running: false, last: null, ready: false };
 
 function rememberPipe(st) {
+  PIPE.ready = true;
   PIPE.running = !!st.running;
   const src = st.running ? {
     streams: st.streams,
@@ -1008,6 +1016,15 @@ function rememberPipe(st) {
 function paintPipeButton() {
   const btn = $("#btn-pipe");
   if (!btn || btn.dataset.busy === "1") return;
+  if (!PIPE.ready) {
+    btn.hidden = true;
+    btn.classList.remove("pipe-ready");
+    btn.textContent = "";
+    btn.removeAttribute("title");
+    return;
+  }
+  btn.hidden = false;
+  btn.classList.add("pipe-ready");
   if (PIPE.running) {
     btn.textContent = "⏸ Pause";
     btn.classList.remove("primary");
